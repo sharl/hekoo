@@ -3,17 +3,27 @@
 # proof of concept with Muse inspired by the amazing invention by @KrisGfx
 # https://github.com/krisgfx9/Wireless-Device-Battery-Monitor
 #
-# hekoo.py -- hekoo Stage 0 (タスクバー帯ホスト、必要最低限)
+# hekoo.py -- hekoo Stage 0 + 画像セグメント (タスクバー帯ホスト、必要最低限)
 #
 # 兵児帯 (hekoobi) から自称した名前。正式な帯 (DeskBand) でも
 # SwiftBar でもない、半端な長さの柔らかい帯をタスクバーに巻く。
 #
-# Stage 0 の範囲 (BASIC_DESIGN.md §8 Stage 0):
-#   - セグメントはテキストのみ。POST /segments/{name} {"text": "..."}
+# 範囲 (BASIC_DESIGN.md §8):
+#   - セグメントはテキストと画像 (同封可)。POST /segments/{name} で
+#     {"text": ...} / {"image": ...} / その両方を投げる。包みとして
+#     {"segment": {...}} の形でもよい (受け口で吸収する)。
+#     text も image も、str でも list でもよい (受け口でリストに正規化)。
+#     text の断片は意味の塊として扱い、描画では途中では切らず、
+#     後ろの断片から落として収める。並びは 画像 (リスト順) → テキスト。
+#     POST は丸ごと差し替え (部分マージはしない。マージだと投げる側が
+#     「今ホストに何が残っているか」を維持し続ける羽目になる)
+#   - 画像は方向に無頓着 (縦帯でも矩形のまま住める)。受け口で1回だけ
+#     デコードして実物で保持し、帯の厚みに合わせて縮小して貼る
 #   - 起動したら API スレッドが立ち、curl で流し込める
 #   - オプションなし。設定は全部このファイル冒頭に埋め込み
 #   - 描画は Pillow、窓は pywin32 のレイヤード子窓 (Tk レス)
-#   - 配置は右起点 + 最大幅キャップだけ。領土交渉の本格版は Stage 1 以降
+#   - 配置は右起点 + 最大幅キャップ + 先住人への回避 (avoid) まで。
+#     本格的な領土交渉は Stage 1 以降
 #
 # お手本: krisgfx9/Wireless-Device-Battery-Monitor (Shell_TrayWnd の子窓方式)
 # テーマ追従の作法の出典: https://github.com/moses-palmer/pystray/issues/130
@@ -21,8 +31,13 @@
 # 使い方 (Windows):
 #   python hekoo.py
 #   jo text="9.8C" | curl -s --json @- localhost:19876/segments/weather
+#   jo image="$(base64 -w0 plate.png)" | curl -s --json @- localhost:19876/segments/snow
+#   jo text="2cm" image="$(base64 -w0 emoji_u2603.png)" | curl -s --json @- localhost:19876/segments/snow
+#   jo segment=$(jo image="$(base64 -w0 emoji_u2603.png)" text=$(jo -a "\-10度" 2cm 1cm/h)) | curl -s --json @- localhost:19876/segments/snow
 
+import base64
 import ctypes
+import io
 import json
 import os
 import re
@@ -46,32 +61,46 @@ MAX_WIDTH = 480          # 帯の最大幅 px。これを超えた分は出さ�
 FONT_SIZE = 22           # 大きく読めることが前提
 PAD_X = 10               # 帯の左右の余白
 GAP = 18                 # セグメント間の余白
+PART_GAP = 6             # セグメント内の画像と文字の間隔
 TEXT_COLOR = (255, 255, 255, 255)
 BG_COLOR = (0, 0, 0, 255)  # 当面は黒プレート (場所の切り分け用。透明に戻すなら (0,0,0,0))
 PLACEHOLDER_TEXT = "hekoo"        # 初期状態 (セグメント無し) の名乗り。本人と合意して正式採用
 PLACEHOLDER_COLOR = (150, 150, 150, 255)
 SHOW_PLACEHOLDER = True           # 空のとき完全に引っ込みたい場合は False
 REPOSITION_MS = 1000     # 再配置と変化チェックの周期
-MAX_BODY = 64 * 1024     # POST body の上限
+MAX_BODY = 4 * 1024 * 1024  # POST body の上限 (base64 の画像が入る大きさ)
+STRIP_HEIGHT = FONT_SIZE + 14  # 帯の厚み px。画像はこの厚みに合わせて縮小する (縦帯なら厚みは幅になる)
+MAX_IMAGE_W = 960        # 受け付ける画像の最大寸法 (超えたら 400)
+MAX_IMAGE_H = 256
 
 NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 
 
 # ---------------------------------------------------------------- セグメント保持
 class SegmentStore:
-    """テキストセグメントの保持。HTTP スレッドと窓側の両方から触るので錠前つき。
+    """セグメントの保持。HTTP スレッドと窓側の両方から触るので錠前つき。
 
+    1セグメントは「テキストと画像を同封した1通の手紙」: 中身は
+    (texts, images) の組で、どちらか一方だけでも、両方でもよい。
+    texts は断片 (意味の塊) のリスト、images はデコード済み画像の
+    リストで、どちらも受け口で正規化済み。
+    POST は丸ごと差し替えで、部分マージはしない。マージだと投げる側が
+    「今ホストに何が残っているか」を維持し続ける羽目になり、隠れた状態は
+    後で必ず驚きを呼ぶ (本人と合意した意味論)。
+    画像は受け口で1回だけデコードした実物 (PIL Image, RGBA) で持つ。
+    描画のたびに base64 をほどいたり PNG を開き直したりはしない
+    (タスクトレイのアイコン生成と同じ作法: 作るのは変化したときだけ)。
     並びは「最初に届いた順」。同名の再 POST は中身だけ差し替えて位置は保つ。
     """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._items = {}   # name -> text (挿入順)
+        self._items = {}   # name -> (texts, images) (挿入順)
         self._version = 0
 
-    def upsert(self, name, text):
+    def upsert(self, name, texts=None, images=None):
         with self._lock:
-            self._items[name] = text
+            self._items[name] = (texts, images)
             self._version += 1
 
     def delete(self, name):
@@ -83,16 +112,96 @@ class SegmentStore:
             return False
 
     def snapshot(self):
-        """(version, [(name, text), ...]) を返す。窓側はこれだけ読む。"""
+        """(version, [(name, texts, images), ...]) を返す。窓側はこれだけ読む。"""
         with self._lock:
-            return self._version, list(self._items.items())
+            return self._version, [(n, ts, im) for n, (ts, im) in self._items.items()]
 
     def public_dict(self):
+        """GET /segments 用。画像は base64 で返さず寸法だけ出す。
+
+        テキストも画像も、要素が1つなら単体、複数ならリストで返す
+        (受け口の正規化と対称な形)。
+        """
         with self._lock:
-            return dict(self._items)
+            out = {}
+            for name, (texts, images) in self._items.items():
+                t = None
+                if texts is not None:
+                    t = texts[0] if len(texts) == 1 else list(texts)
+                dims = None
+                if images is not None:
+                    ds = [f"{im.size[0]}x{im.size[1]}" for im in images]
+                    dims = ds[0] if len(ds) == 1 else ds
+                if dims is not None:
+                    out[name] = {"text": t, "image": dims} if t is not None else {"image": dims}
+                else:
+                    out[name] = t
+            return out
 
 
 # ---------------------------------------------------------------- HTTP 受け口
+def _normalize_texts(value):
+    """text フィールドを断片リストに正規化する。
+
+    str なら [str]、list ならそのまま (要素は全部、空でない str)、
+    フィールド自が無ければ None、形が変なら False を返す。
+    断片は投げる側が意味で刻んだ塊で、ホストは途中では切らない。
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [value] if value != "" else False
+    if isinstance(value, list):
+        if all(isinstance(t, str) and t != "" for t in value):
+            return list(value) or None
+        return False
+    return False
+
+
+def _normalize_images(value):
+    """image フィールドをデコード済み画像のリストに正規化する。
+
+    str なら [画像]、list なら各要素をデコード (全部 base64 文字列)、
+    フィールド自が無ければ None、形が変だったり1つでもデコードに
+    失敗したら False。デコードはここで1回だけ (SegmentStore 参照)。
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = [value]
+    if isinstance(value, list):
+        if not value:
+            return None
+        out = []
+        for v in value:
+            if not isinstance(v, str):
+                return False
+            img = _decode_image(v)
+            if img is None:
+                return False
+            out.append(img)
+        return out
+    return False
+
+
+def _decode_image(b64):
+    """base64 の画像を PIL Image (RGBA) にして返す。変なものは None。
+
+    ここで1回だけデコードして実物で保持するのが肝 (SegmentStore 参照)。
+    寸法の上限を超えるものは受けない。
+    """
+    try:
+        raw = base64.b64decode(b64, validate=True)
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        img = img.convert("RGBA")
+    except Exception:
+        return None
+    if img.size[0] > MAX_IMAGE_W or img.size[1] > MAX_IMAGE_H:
+        return None
+    return img
+
+
 def make_handler(store):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):  # 常駐物なので黙る
@@ -125,12 +234,23 @@ def make_handler(store):
                 return self._send_json(400, {"ok": False, "error": "bad body size"})
             try:
                 obj = json.loads(self.rfile.read(length).decode("utf-8"))
-                text = obj["text"]
-                if not isinstance(text, str) or text == "":
+                if not isinstance(obj, dict):
                     raise ValueError
             except Exception:
-                return self._send_json(400, {"ok": False, "error": "need {\"text\": \"...\"}"})
-            store.upsert(name, text)
+                return self._send_json(400, {"ok": False, "error": "need JSON body"})
+            fields = obj.get("segment")
+            if not isinstance(fields, dict):
+                fields = obj  # 包みが無ければトップレベル自体がフィールド
+            texts = _normalize_texts(fields.get("text"))
+            if texts is False:
+                return self._send_json(400, {"ok": False, "error": "bad text"})
+            images = _normalize_images(fields.get("image"))
+            if images is False:
+                return self._send_json(400, {"ok": False, "error": "bad image"})
+            if texts is None and images is None:
+                return self._send_json(
+                    400, {"ok": False, "error": "need \"text\" and/or \"image\""})
+            store.upsert(name, texts, images)
             return self._send_json(200, {"ok": True, "name": name})
 
         def do_DELETE(self):
@@ -209,39 +329,122 @@ def _fit_text(meas, text, limit):
     return (t + "…") if t else None
 
 
-def render_strip(items, color=TEXT_COLOR):
-    """[(name, text), ...] から帯の画像 (RGBA) を作る。
+def _fit_fragments(meas, fragments, limit):
+    """断片リストを limit px に収まる形に繋いで返す。
 
-    MAX_WIDTH に入らない分は、まず「…」で切り詰めて収め、それでも
-    入らない分は右から落とす (Stage 0 の領土交渉はここまで)。
+    断片は投げる側が意味で刻んだ塊 (例: ["-10度", "2cm", "1cm/h"] の
+    測定値ひとつひとつ)。途中では切らず、入る所までを半角スペースで
+    繋ぎ、後ろの断片から落とす。最初の断片すら入らなければ、その断片
+    だけ「…」で切り詰める (単一 str の従来動作)。何も入らなければ None。
+    """
+    def w(s):
+        b = meas.textbbox((0, 0), s, font=_FONT)
+        return b[2] - b[0]
+
+    kept = []
+    for frag in fragments:
+        cand = " ".join(kept + [frag])
+        if w(cand) <= limit:
+            kept.append(frag)
+        else:
+            break
+    if kept:
+        return " ".join(kept)
+    return _fit_text(meas, fragments[0], limit)
+
+
+def _fit_image(img, thickness):
+    """帯の厚みに合わせて画像を縮小する (拡大はしない)。
+
+    横帯なら厚みは高さ、縦帯なら幅になる。画像は方向に無頓着なので、
+    効くのはこの「厚みに合わせる」原則だけ。
+    """
+    w, h = img.size
+    if h <= thickness:
+        return img
+    nw = max(1, round(w * thickness / h))
+    return img.resize((nw, thickness), Image.LANCZOS)
+
+
+def _images_width(ims):
+    """画像列の合計幅 (間の PART_GAP 込み)。空なら 0。"""
+    if not ims:
+        return 0
+    return sum(im.size[0] for im in ims) + PART_GAP * (len(ims) - 1)
+
+
+def render_strip(items, color=TEXT_COLOR):
+    """[(name, texts, images), ...] から帯の画像 (RGBA) を作る。
+
+    1セグメントは、画像列とテキストを同封した1ユニットとして描く
+    (画像 (リスト順) → PART_GAP → テキストの順)。MAX_WIDTH に入らない
+    ときの縮退は、まずテキスト (断片の後ろから落とし、最後の1断片は
+    「…」で切り詰める)、それも無理ならテキストを落として画像だけ残し
+    (§6.1 の icon-only 縮退)、画像列だけでも入らなければ後ろの画像から
+    落とし、それでも無理ならそのセグメントで打ち切る。
     セグメントが無ければ None。
+    画像は保持しているオリジナルから、描画のたびに厚みへ再計算して貼る。
     """
     if not items:
         return None
     meas = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
-    kept = []
+    kept = []  # (ims, fitted_text, text_w, text_bbox)
     width = PAD_X * 2
-    for _name, text in items:
+    for _name, texts, images in items:
         gap = GAP if kept else 0
-        fitted = _fit_text(meas, text, MAX_WIDTH - width - gap)
-        if fitted is None:
-            break
-        bbox = meas.textbbox((0, 0), fitted, font=_FONT)
-        tw = bbox[2] - bbox[0]
-        kept.append((fitted, tw, bbox))
-        width += gap + tw
+        avail = MAX_WIDTH - width - gap
+        ims = [_fit_image(im, STRIP_HEIGHT) for im in images] if images else []
+        fitted = None
+        bbox = None
+        tw = 0
+        if texts is not None:
+            t_avail = avail - _images_width(ims) - (PART_GAP if ims else 0)
+            fitted = _fit_fragments(meas, texts, t_avail) if t_avail > 0 else None
+            if fitted is not None:
+                bbox = meas.textbbox((0, 0), fitted, font=_FONT)
+                tw = bbox[2] - bbox[0]
+            # fitted が None ならテキストは落とす (画像があれば icon-only 側へ)
+        while ims and _images_width(ims) + (PART_GAP if fitted is not None else 0) + tw > avail:
+            ims.pop()  # 画像列だけでも入らなければ、後ろの画像から落とす
+        if not ims and fitted is None:
+            break  # このセグメントは収まらないので打ち切る
+        unit_w = _images_width(ims) + (PART_GAP if (ims and fitted is not None) else 0) + tw
+        kept.append((ims, fitted, tw, bbox))
+        width += gap + unit_w
     if not kept:
         return None
-    height = FONT_SIZE + 14
+    height = STRIP_HEIGHT
     img = Image.new("RGBA", (width, height), BG_COLOR)
     draw = ImageDraw.Draw(img)
     x = PAD_X
-    for text, tw, bbox in kept:
-        # textbbox の上端オフセットを引いて、見た目で縦中央に寄せる
-        y = (height - (bbox[3] - bbox[1])) // 2 - bbox[1]
-        draw.text((x, y), text, font=_FONT, fill=color)
-        x += tw + GAP
+    for ims, fitted, tw, bbox in kept:
+        for j, im in enumerate(ims):
+            if j:
+                x += PART_GAP
+            img.alpha_composite(im, (x, (height - im.size[1]) // 2))
+            x += im.size[0]
+        if fitted is not None:
+            if ims:
+                x += PART_GAP
+            # textbbox の上端オフセットを引いて、見た目で縦中央に寄せる
+            y = (height - (bbox[3] - bbox[1])) // 2 - bbox[1]
+            draw.text((x, y), fitted, font=_FONT, fill=color)
+            x += tw
+        x += GAP
     return img
+
+
+def _describe(items):
+    """ログ用にセグメントを短く表す。画像の実物は repr せず寸法だけ出す。"""
+    out = []
+    for name, texts, images in items:
+        parts = []
+        if texts is not None:
+            parts.append(" ".join(texts))
+        if images:
+            parts.extend(f"<image {im.size[0]}x{im.size[1]}>" for im in images)
+        out.append((name, " ".join(parts)))
+    return out
 
 
 def _to_bgra_premultiplied(img):
@@ -303,6 +506,7 @@ class StripHost:
         self._size = (0, 0)
         self._client_xy = (0, 0)
         self._anchor = None
+        self._tray_rect = None
         self._class_atom = None
         self._taskbar_created = win32gui.RegisterWindowMessage("TaskbarCreated")
 
@@ -522,15 +726,25 @@ class StripHost:
             self.attach()
             if self.tray is None:
                 return 0
+        # タスクバーの位置・大きさ・向きが変わったら描き直させる。
+        # オリエンテーションの変更は再描画で吸収する (本人の見立て)
+        try:
+            rect = win32gui.GetWindowRect(self.tray)
+        except Exception:
+            rect = None
+        if rect is not None:
+            if self._tray_rect is not None and rect != self._tray_rect:
+                self._version = -1
+            self._tray_rect = rect
         version, items = self.store.snapshot()
         if version != self._version:
             self._version = version
-            _log(f"timer: version={version} items={items}")
+            _log(f"timer: version={version} items={_describe(items)}")
             img = render_strip(items)
             if img is None and SHOW_PLACEHOLDER:
                 # 空でも名札だけは出す: 「常駐したよ、ここに出るよ」が見える方が
                 # 確認が楽 (本人の指摘)。本物のセグメントが来たらそちらに譲る
-                img = render_strip([("hekoo", PLACEHOLDER_TEXT)], color=PLACEHOLDER_COLOR)
+                img = render_strip([("hekoo", [PLACEHOLDER_TEXT], None)], color=PLACEHOLDER_COLOR)
             if img is None:
                 win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
                 self._size = (0, 0)
