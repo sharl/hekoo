@@ -302,6 +302,7 @@ class StripHost:
         self._version = -1
         self._size = (0, 0)
         self._client_xy = (0, 0)
+        self._anchor = None
         self._class_atom = None
         self._taskbar_created = win32gui.RegisterWindowMessage("TaskbarCreated")
 
@@ -349,15 +350,73 @@ class StripHost:
         user32.SetTimer(self.hwnd, 1, REPOSITION_MS, None)
 
     # --- 配置と転送 ---
+    def _anchor_left(self, notify_left):
+        """帯の右端を付けるスクリーン x を返す (「ここでーす」の検出)。
+
+        既定は TrayNotifyWnd の左端。ただし、その左隣に先住人の帯 (タスクバーの
+        子窓で、右端がうちのアンカーに接しているもの) が居たら、その左端まで
+        ずれる。帯が連なっていれば連なりの一番左まで。先住人の名前は問わない
+        (BatteryHub でも何でも、接して居れば隣に並ぶ)。
+        同時起動で同じ場所を取り合うと、互いに HWND_TOP を主張し合って
+        点滅する (実機で確認)。重ならないことが回避の第一歩。
+        """
+        anchor = notify_left
+        try:
+            children = []
+
+            def _cb(hwnd, acc):
+                if win32gui.GetParent(hwnd) == self.tray:
+                    acc.append(hwnd)
+                return True
+
+            win32gui.EnumChildWindows(self.tray, _cb, children)
+            _tx, tray_top, _tx2, tray_bottom = win32gui.GetWindowRect(self.tray)
+        except Exception:
+            return anchor
+        for _ in range(8):  # 連なりをたどる上限
+            found = None
+            for h in children:
+                if h in (self.hwnd, self.notify) or not win32gui.IsWindowVisible(h):
+                    continue
+                try:
+                    l, t, r, b = win32gui.GetWindowRect(h)
+                except Exception:
+                    continue
+                # 右端が今のアンカーに接していて、縦位置がタスクバーと重なるもの
+                if anchor - 10 <= r <= anchor + 2 and l < r and t < tray_bottom and b > tray_top:
+                    if found is None or l < found:
+                        found = l
+            if found is None:
+                break
+            anchor = found
+        return anchor
+
     def _reposition(self, width, height):
-        """右起点: TrayNotifyWnd の左端に帯の右端を合わせる。"""
+        """右起点: アンカー (通常は TrayNotifyWnd の左端、先住人が居ればその左) に
+        帯の右端を合わせる。"""
         if not self.notify:
             return False
         tx, ty, _tx2, ty2 = win32gui.GetWindowRect(self.tray)
         nx, _ny, _nx2, _ny2 = win32gui.GetWindowRect(self.notify)
-        sx = nx - width
+        anchor = self._anchor_left(nx)
+        if anchor != self._anchor:
+            if anchor < nx:
+                _log(f"anchor: 先住人がいるので左へずれる (notify left={nx} -> {anchor})")
+            elif self._anchor is not None:
+                _log(f"anchor: 先住人がいなくなったので定位置へ (notify left={nx})")
+            self._anchor = anchor
+        sx = anchor - width
         sy = ty + ((ty2 - ty) - height) // 2
         cx, cy = win32gui.ScreenToClient(self.tray, (sx, sy))
+        if (cx, cy) == self._client_xy and (width, height) == self._size:
+            # 場所もサイズも同じで、自分が兄弟の一番上なら触らない。
+            # 毎秒 HWND_TOP を主張し直すと、先住人と主張し合って点滅の種になる
+            try:
+                if (win32gui.IsWindowVisible(self.hwnd)
+                        and win32gui.GetWindow(self.hwnd, win32con.GW_HWNDPREV) is None):
+                    return True
+            except Exception:
+                pass
         # HWND_TOP + SWP_SHOWWINDOW: 兄弟 (XAML アイランド等) の一番上に置いて見せ続ける。
         # お手本 widget.cpp の PositionMirror と同じ流儀 (SWP_NOZORDER だと埋もれる)
         win32gui.SetWindowPos(
