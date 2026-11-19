@@ -5,6 +5,27 @@
 proof of concept with Muse inspired by the amazing invention by @KrisGfx
 https://github.com/krisgfx9/Wireless-Device-Battery-Monitor
 
+## Run
+
+```powershell
+git clone https://github.com/sharl/hekoo.git
+cd hekoo
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+python hekoo.py
+```
+
+### Re-run
+
+```powershell
+cd hekoo
+.\.venv\Scripts\activate
+python hekoo.py
+```
+
+## Usage
+
 ```bash
 $ jo text="hello, hekoo" | curl --json @- 192.168.0.1:19876/segments/hekoo
 {"ok": true, "name": "hekoo"}
