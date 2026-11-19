@@ -18,3 +18,8 @@ $ jo segment=$(jo image="$(base64 -w0 emoji_u2603.png)" text=$(jo -a "\-10度" 2
 ```
 
 ![hekoo weather](Assets/weather.png)
+
+### SEE ALSO
+
+Examples use [jo](https://github.com/jpmens/jo) to build JSON from shell arguments.
+Plain JSON works too: curl --json '{"text": "hello, hekoo"}' ...
