@@ -1,6 +1,12 @@
+.exp/
 .flake8
-Makefile
-*.sh
-*.ps1
-*.png
+.venv/
 *.log
+*.png
+*.ps1
+*.sh
+*.spec
+Makefile
+__pycache__/
+build/
+dist/
