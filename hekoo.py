@@ -39,10 +39,13 @@ import base64
 import ctypes
 import io
 import json
+import logging
 import os
 import re
 import signal
+import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
@@ -72,6 +75,8 @@ MAX_BODY = 4 * 1024 * 1024  # POST body の上限 (base64 の画像が入る大�
 STRIP_HEIGHT = FONT_SIZE + 14  # 帯の厚み px。画像はこの厚みに合わせて縮小する (縦帯なら厚みは幅になる)
 MAX_IMAGE_W = 960        # 受け付ける画像の最大寸法 (超えたら 400)
 MAX_IMAGE_H = 256
+DEFAULT_TTL = 900        # ttl 申告なしのときの既定値 (秒)。天気ポスターの周期5分の
+                         # 3周期分を目安に置いた初期値 (2026-11-22、実測から)
 
 NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 
@@ -91,17 +96,33 @@ class SegmentStore:
     描画のたびに base64 をほどいたり PNG を開き直したりはしない
     (タスクトレイのアイコン生成と同じ作法: 作るのは変化したときだけ)。
     並びは「最初に届いた順」。同名の再 POST は中身だけ差し替えて位置は保つ。
+    TTL: 各セグメントは失効時刻 (time.monotonic の期限、None は無期限) を
+    持ち、期限を過ぎたら purge_expired() が落とす。再 POST のたびに
+    期限は張り直される (定期投げが生存確認を兼ねる、という設計原則)。
     """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._items = {}   # name -> (texts, images) (挿入順)
+        self._items = {}   # name -> (texts, images, expires_at) (挿入順)
         self._version = 0
 
-    def upsert(self, name, texts=None, images=None):
+    def upsert(self, name, texts=None, images=None, ttl=DEFAULT_TTL):
+        expires = None if ttl == 0 else time.monotonic() + ttl
         with self._lock:
-            self._items[name] = (texts, images)
+            self._items[name] = (texts, images, expires)
             self._version += 1
+
+    def purge_expired(self):
+        """期限切れのセグメントを落とし、落とした名前のリストを返す。"""
+        now = time.monotonic()
+        with self._lock:
+            expired = [n for n, (_t, _i, exp) in self._items.items()
+                       if exp is not None and exp <= now]
+            for n in expired:
+                del self._items[n]
+            if expired:
+                self._version += 1
+            return expired
 
     def delete(self, name):
         with self._lock:
@@ -114,7 +135,7 @@ class SegmentStore:
     def snapshot(self):
         """(version, [(name, texts, images), ...]) を返す。窓側はこれだけ読む。"""
         with self._lock:
-            return self._version, [(n, ts, im) for n, (ts, im) in self._items.items()]
+            return self._version, [(n, ts, im) for n, (ts, im, _e) in self._items.items()]
 
     def public_dict(self):
         """GET /segments 用。画像は base64 で返さず寸法だけ出す。
@@ -124,7 +145,7 @@ class SegmentStore:
         """
         with self._lock:
             out = {}
-            for name, (texts, images) in self._items.items():
+            for name, (texts, images, _exp) in self._items.items():
                 t = None
                 if texts is not None:
                     t = texts[0] if len(texts) == 1 else list(texts)
@@ -182,6 +203,23 @@ def _normalize_images(value):
             out.append(img)
         return out
     return False
+
+
+def _normalize_ttl(value):
+    """ttl フィールド (秒) を正規化する。
+
+    フィールド自が無ければ (null も同じ) None = 申告なし (既定値が効く)。
+    0 は無期限。正の数ならその秒数。負数や数でないものは False。
+    bool は int の顔をして紛れ込むので明示的に弾く。
+    値付けの目安は投稿側の作法: 自分の更新周期より長く申告すること。
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if value < 0:
+        return False
+    return value
 
 
 def _decode_image(b64):
@@ -247,10 +285,20 @@ def make_handler(store):
             images = _normalize_images(fields.get("image"))
             if images is False:
                 return self._send_json(400, {"ok": False, "error": "bad image"})
+            ttl = _normalize_ttl(fields.get("ttl"))
+            if ttl is False:
+                return self._send_json(400, {"ok": False, "error": "bad ttl"})
             if texts is None and images is None:
                 return self._send_json(
                     400, {"ok": False, "error": "need \"text\" and/or \"image\""})
-            store.upsert(name, texts, images)
+            if ttl is None:
+                effective, source = DEFAULT_TTL, "default"
+            elif ttl == 0:
+                effective, source = 0, "never"
+            else:
+                effective, source = ttl, "declared"
+            store.upsert(name, texts, images, ttl=effective)
+            _log(f"post: {name} ttl={effective:g}s ({source})")
             return self._send_json(200, {"ok": True, "name": name})
 
         def do_DELETE(self):
@@ -456,22 +504,34 @@ def _to_bgra_premultiplied(img):
     return Image.merge("RGBA", (b, g, r, a)).tobytes()
 
 
-def _log(msg):
-    """切り分け用のログ。コンソール起動 (py hekoo.py) のときは標準出力にも出す。
+# ---------------------------------------------------------------- ログ
+# 時刻付きで出すために logging を素直に使う (手書きの _log は廃止)。
+# コンソール起動 (py hekoo.py) のときは標準出力にも出す (本人の進め方)。
+# ファイルにも残すのは、コンソールなしで常駐させる将来のため。
+# 時刻がないと「いつの投稿で状態が変わったか」が追えないので、
+# フォーマットには必ず時刻を入れる (2026-11-22、画像消失の切り分けで痛感)。
+logger = logging.getLogger("hekoo")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+if not logger.handlers:
+    _formatter = logging.Formatter(
+        "%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    _stream = logging.StreamHandler(sys.stdout)
+    _stream.setFormatter(_formatter)
+    logger.addHandler(_stream)
+    try:
+        _file = logging.FileHandler(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "hekoo.log"),
+            encoding="utf-8", delay=True)
+        _file.setFormatter(_formatter)
+        logger.addHandler(_file)
+    except Exception:
+        pass
 
-    開発中はコンソールで起動するので画面で見える方が確認が楽 (本人の進め方)。
-    ファイルにも残すのは、コンソールなしで常駐させる将来のため。
-    """
-    try:
-        print(msg, flush=True)
-    except Exception:
-        pass
-    try:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hekoo.log")
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(msg + "\n")
-    except Exception:
-        pass
+
+def _log(msg):
+    """既存の呼び出し口をそのままに、logger へ流すだけの薄い包み。"""
+    logger.info(msg)
 
 
 # ---------------------------------------------------------------- テーマ追従の作法
@@ -736,6 +796,8 @@ class StripHost:
             if self._tray_rect is not None and rect != self._tray_rect:
                 self._version = -1
             self._tray_rect = rect
+        for n in self.store.purge_expired():
+            _log(f"expire: {n} (ttl)")
         version, items = self.store.snapshot()
         if version != self._version:
             self._version = version
