@@ -619,7 +619,7 @@ class StripHost:
         self._size = (0, 0)
         self._client_xy = (0, 0)
         self._follower = AnchorFollower()
-        self._was_top = None
+        self._zstate = None
         self._tray_rect = None
         self._class_atom = None
         self._taskbar_created = win32gui.RegisterWindowMessage("TaskbarCreated")
@@ -738,15 +738,20 @@ class StripHost:
             # ちらつきの切り分け用)。
             try:
                 visible = bool(win32gui.IsWindowVisible(self.hwnd))
-                prev = win32gui.GetWindow(self.hwnd, win32con.GW_HWNDPREV)
-                top = visible and prev is None
-                if top != self._was_top:
-                    if top:
+                # GW_HWNDPREV が無い (= 一番上) ときの戻りは None のことも
+                # 0 のこともある (実機で prev=0 を観測したので寄せておく)
+                prev = win32gui.GetWindow(self.hwnd, win32con.GW_HWNDPREV) or None
+                # 遷移判定は「実測した状態」だけで行う。SetWindowPos の後に
+                # 「一番上になったはず」と仮の状態を書くと、実測と毎回
+                # 食い違ってログが毎秒出るバグになる (2026-11-22 実機で踏んだ)
+                state = (visible and prev is None, prev)
+                if state != self._zstate:
+                    if state[0]:
                         _log("zorder: 一番上を取り戻した")
                     else:
                         _log(f"zorder: 一番上ではない (visible={int(visible)} prev={prev})")
-                    self._was_top = top
-                if top:
+                    self._zstate = state
+                if state[0]:
                     return True
             except Exception:
                 pass
@@ -756,7 +761,6 @@ class StripHost:
             self.hwnd, win32con.HWND_TOP, cx, cy, width, height,
             win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW,
         )
-        self._was_top = True
         if (cx, cy) != self._client_xy or (width, height) != self._size:
             _log(f"place: {width}x{height} at client=({cx}, {cy})")
         self._client_xy = (cx, cy)
