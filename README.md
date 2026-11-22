@@ -4,7 +4,7 @@ bring your messages/images on the taskbar
 
 ### What does 'hekoo' mean?
 
-'hekoo' is a coined term inspired by the 'heko-obi' (兵児帯), a soft sash.
+'hekoo' is a coined term inspired by the 'heko-obi' (兵児帯), a soft sash.  
 Picture a band made of software - the image comes from an association
 with the lost 'deskband'.
 
