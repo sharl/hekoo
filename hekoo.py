@@ -100,9 +100,9 @@ class SegmentStore:
     描画のたびに base64 をほどいたり PNG を開き直したりはしない
     (タスクトレイのアイコン生成と同じ作法: 作るのは変化したときだけ)。
     並びは「最初に届いた順」。同名の再 POST は中身だけ差し替えて位置は保つ。
-    TTL: 各セグメントは失効時刻 (time.monotonic の期限、None は無期限) を
-    持ち、期限を過ぎたら purge_expired() が落とす。再 POST のたびに
-    期限は張り直される (定期投げが生存確認を兼ねる、という設計原則)。
+    TTL: 各セグメントは失効時刻 (time.monotonic の期限) を持ち、期限を
+    過ぎたら purge_expired() が落とす。再 POST のたびに期限は張り直
+    される (定期投げが生存確認を兼ねる、という設計原則)。
     """
 
     def __init__(self):
@@ -111,7 +111,7 @@ class SegmentStore:
         self._version = 0
 
     def upsert(self, name, texts=None, images=None, ttl=DEFAULT_TTL):
-        expires = None if ttl == 0 else time.monotonic() + ttl
+        expires = time.monotonic() + ttl
         with self._lock:
             self._items[name] = (texts, images, expires)
             self._version += 1
@@ -121,7 +121,7 @@ class SegmentStore:
         now = time.monotonic()
         with self._lock:
             expired = [n for n, (_t, _i, exp) in self._items.items()
-                       if exp is not None and exp <= now]
+                       if exp <= now]
             for n in expired:
                 del self._items[n]
             if expired:
@@ -213,7 +213,11 @@ def _normalize_ttl(value):
     """ttl フィールド (秒) を正規化する。
 
     フィールド自が無ければ (null も同じ) None = 申告なし (既定値が効く)。
-    0 は無期限。正の数ならその秒数。負数や数でないものは False。
+    数は寿命の秒数そのもの: デクリメントして 0 になったら期限切れ、
+    という数え方をするので、0 はその場で失効する。負数や数でない
+    ものは False。"never" のような無期限の特別形式は持たない
+    (ホスト再起動で全セグメントが消える以上、無期限は実在しない。
+    長く生かしたいものは大きな数を書く。2026-11-22 本人決定)。
     bool は int の顔をして紛れ込むので明示的に弾く。
     値付けの目安は投稿側の作法: 自分の更新周期より長く申告すること。
     """
@@ -297,8 +301,6 @@ def make_handler(store):
                     400, {"ok": False, "error": "need \"text\" and/or \"image\""})
             if ttl is None:
                 effective, source = DEFAULT_TTL, "default"
-            elif ttl == 0:
-                effective, source = 0, "never"
             else:
                 effective, source = ttl, "declared"
             store.upsert(name, texts, images, ttl=effective)
@@ -617,6 +619,7 @@ class StripHost:
         self._size = (0, 0)
         self._client_xy = (0, 0)
         self._follower = AnchorFollower()
+        self._was_top = None
         self._tray_rect = None
         self._class_atom = None
         self._taskbar_created = win32gui.RegisterWindowMessage("TaskbarCreated")
@@ -729,10 +732,21 @@ class StripHost:
         cx, cy = win32gui.ScreenToClient(self.tray, (sx, sy))
         if (cx, cy) == self._client_xy and (width, height) == self._size:
             # 場所もサイズも同じで、自分が兄弟の一番上なら触らない。
-            # 毎秒 HWND_TOP を主張し直すと、先住人と主張し合って点滅の種になる
+            # 毎秒 HWND_TOP を主張し直すと、先住人と主張し合って点滅の種になる。
+            # 一番上でない状態は無言で主張し直していたので、遷移だけログに
+            # 残す (2026-11-22、位置が落ち着いた後に残った不定期な
+            # ちらつきの切り分け用)。
             try:
-                if (win32gui.IsWindowVisible(self.hwnd)
-                        and win32gui.GetWindow(self.hwnd, win32con.GW_HWNDPREV) is None):
+                visible = bool(win32gui.IsWindowVisible(self.hwnd))
+                prev = win32gui.GetWindow(self.hwnd, win32con.GW_HWNDPREV)
+                top = visible and prev is None
+                if top != self._was_top:
+                    if top:
+                        _log("zorder: 一番上を取り戻した")
+                    else:
+                        _log(f"zorder: 一番上ではない (visible={int(visible)} prev={prev})")
+                    self._was_top = top
+                if top:
                     return True
             except Exception:
                 pass
@@ -742,6 +756,7 @@ class StripHost:
             self.hwnd, win32con.HWND_TOP, cx, cy, width, height,
             win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW,
         )
+        self._was_top = True
         if (cx, cy) != self._client_xy or (width, height) != self._size:
             _log(f"place: {width}x{height} at client=({cx}, {cy})")
         self._client_xy = (cx, cy)
@@ -849,6 +864,7 @@ class StripHost:
             rect = None
         if rect is not None:
             if self._tray_rect is not None and rect != self._tray_rect:
+                _log(f"tray: rect changed {self._tray_rect} -> {rect}")
                 self._version = -1
             self._tray_rect = rect
         for n in self.store.purge_expired():
