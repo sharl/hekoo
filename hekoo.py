@@ -71,6 +71,10 @@ PLACEHOLDER_TEXT = "hekoo"        # 初期状態 (セグメント無し) の名�
 PLACEHOLDER_COLOR = (150, 150, 150, 255)
 SHOW_PLACEHOLDER = True           # 空のとき完全に引っ込みたい場合は False
 REPOSITION_MS = 1000     # 再配置と変化チェックの周期
+ANCHOR_DEADBAND = 8      # アンカーの右戻りで無視する幅 px (これ以下は停泊)
+ANCHOR_RESTORE_CYCLES = 60  # 右への大きな戻りを確定するまでの連続観測回数
+                         # (タイマ周期 1 秒なので約60秒。先住人の一時的な
+                         # 消失・再出現のバタつきを乗り切るための確認待ち)
 MAX_BODY = 4 * 1024 * 1024  # POST body の上限 (base64 の画像が入る大きさ)
 STRIP_HEIGHT = FONT_SIZE + 14  # 帯の厚み px。画像はこの厚みに合わせて縮小する (縦帯なら厚みは幅になる)
 MAX_IMAGE_W = 960        # 受け付ける画像の最大寸法 (超えたら 400)
@@ -552,6 +556,53 @@ def apply_theme_ritual():
 
 
 # ---------------------------------------------------------------- Win32 ホスト
+class AnchorFollower:
+    """アンカー追随の非対称ポリシー (純粋な状態機械、窓には触らない)。
+
+    左 (譲る) は即時、右 (戻る) は慎重に:
+    - 左への移動は領土の話 (被せない) なので即座に追う。
+    - 右への移動は見た目の話でしかないので、ANCHOR_DEADBAND 以下の
+      戻りは無視して停泊し、それを超える戻りも ANCHOR_RESTORE_CYCLES
+      回連続で同じ値を観測してから確定する。
+    発端の実測 (2026-11-22): 先住人の幅が 6px だけ約61秒間広がって
+    戻る、を繰り返し、律儀に追う帯がそのたび往復してちらついた。
+    右戻りを停泊させれば往復は消え、代償は先住人が細い間の
+    最大 ANCHOR_DEADBAND px の隙間だけ。
+    """
+
+    def __init__(self):
+        self.applied = None      # 実際に使っているアンカー
+        self._candidate = None   # 右戻りの候補
+        self._count = 0          # 候補の連続観測回数
+
+    def update(self, measured):
+        """測定値を1回分食わせ、適用すべきアンカーを返す。"""
+        if self.applied is None:
+            self.applied = measured
+            return self.applied
+        if measured <= self.applied:
+            # 左 (譲る) か不変。即時に追い、右戻りの数え直しは捨てる
+            self.applied = measured
+            self._candidate = None
+            self._count = 0
+            return self.applied
+        # 右 (戻る)
+        if measured - self.applied <= ANCHOR_DEADBAND:
+            self._candidate = None
+            self._count = 0
+            return self.applied
+        if measured == self._candidate:
+            self._count += 1
+        else:
+            self._candidate = measured
+            self._count = 1
+        if self._count >= ANCHOR_RESTORE_CYCLES:
+            self.applied = measured
+            self._candidate = None
+            self._count = 0
+        return self.applied
+
+
 class StripHost:
     """Shell_TrayWnd のレイヤード子窓として帯を出す。お手本の Create/Reposition 相当。"""
 
@@ -565,7 +616,7 @@ class StripHost:
         self._version = -1
         self._size = (0, 0)
         self._client_xy = (0, 0)
-        self._anchor = None
+        self._follower = AnchorFollower()
         self._tray_rect = None
         self._class_atom = None
         self._taskbar_created = win32gui.RegisterWindowMessage("TaskbarCreated")
@@ -662,13 +713,17 @@ class StripHost:
             return False
         tx, ty, _tx2, ty2 = win32gui.GetWindowRect(self.tray)
         nx, _ny, _nx2, _ny2 = win32gui.GetWindowRect(self.notify)
-        anchor = self._anchor_left(nx)
-        if anchor != self._anchor:
-            if anchor < nx:
-                _log(f"anchor: 先住人がいるので左へずれる (notify left={nx} -> {anchor})")
-            elif self._anchor is not None:
+        measured = self._anchor_left(nx)
+        prev = self._follower.applied
+        anchor = self._follower.update(measured)
+        if anchor != prev:
+            if prev is None or anchor < prev:
+                if anchor < nx:
+                    _log(f"anchor: 先住人がいるので左へずれる (notify left={nx} -> {anchor})")
+            elif anchor >= nx:
                 _log(f"anchor: 先住人がいなくなったので定位置へ (notify left={nx})")
-            self._anchor = anchor
+            else:
+                _log(f"anchor: 先住人が縮んだので右へ戻る (notify left={nx} -> {anchor})")
         sx = anchor - width
         sy = ty + ((ty2 - ty) - height) // 2
         cx, cy = win32gui.ScreenToClient(self.tray, (sx, sy))
