@@ -50,6 +50,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
 
+from getLog import getLog
+
 try:
     import win32api
     import win32con
@@ -511,6 +513,10 @@ def _to_bgra_premultiplied(img):
 
 
 # ---------------------------------------------------------------- ログ
+# ログの置き場所は家の決め (getLog.py): XDG_STATE_HOME があればそこ、
+# なければ ~/.local/state の下にアプリ名で切る。実行ディレクトリや
+# スクリプトの隣に生やすと、exe 化したときに置き場所が定まらない
+# (2026-11-24 本人の決め)。
 # 時刻付きで出すために logging を素直に使う (手書きの _log は廃止)。
 # コンソール起動 (py hekoo.py) のときは標準出力にも出す (本人の進め方)。
 # ファイルにも残すのは、コンソールなしで常駐させる将来のため。
@@ -527,7 +533,7 @@ if not logger.handlers:
     logger.addHandler(_stream)
     try:
         _file = logging.FileHandler(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "hekoo.log"),
+            getLog("hekoo", "hekoo.log"),
             encoding="utf-8", delay=True)
         _file.setFormatter(_formatter)
         logger.addHandler(_file)
