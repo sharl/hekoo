@@ -2,7 +2,6 @@
 .flake8
 .venv/
 *.log
-*.png
 *.ps1
 *.sh
 *.spec
