@@ -47,7 +47,8 @@ jobs:
             "--noconsole" `
             "--icon=Assets/sample.ico" `
             "--exclude-module=PIL._imagingcms" `
-            "--exclude-module=PIL._imagingtk"
+            "--exclude-module=PIL._imagingtk" `
+            "--add-data=Assets/version.txt;Assets"
           pushd dist
           Compress-Archive -Path "${env:APP_NAME}.exe" -DestinationPath "${env:APP_NAME}-${{ env.VERSION }}.zip"
           popd

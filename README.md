@@ -74,5 +74,5 @@ https://github.com/jpmens/jo
 
 ```powershell
 pip install pyinstaller
-pyinstaller "hekoo.py" "--onefile" "--noconsole" "--icon=Assets/sample.ico" "--exclude-module=PIL._imagingcms" "--exclude-module=PIL._imagingtk"
+pyinstaller "hekoo.py" "--onefile" "--noconsole" "--icon=Assets/sample.ico" "--exclude-module=PIL._imagingcms" "--exclude-module=PIL._imagingtk" "--add-data=Assets/version.txt;Assets"
 ```

@@ -35,54 +35,66 @@
 #   jo text="2cm" image="$(base64 -w0 emoji_u2603.png)" | curl -s --json @- localhost:19876/segments/snow
 #   jo segment=$(jo image="$(base64 -w0 emoji_u2603.png)" text=$(jo -a "\-10度" 2cm 1cm/h)) | curl -s --json @- localhost:19876/segments/snow
 
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import base64
 import ctypes
 import io
 import json
 import logging
-import os
 import re
 import signal
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 from getLog import getLog
+from utils import resource_path
 
 try:
     import win32api
     import win32con
     import win32gui
-except ImportError:  # Windows 以外では API/描画部分だけ import 可能にする (検証用)
+except ImportError:     # Windows 以外では API/描画部分だけ import 可能にする (検証用)
     win32api = win32con = win32gui = None
 
+
+def getVersion():
+    v = 'test'
+    try:
+        with open(resource_path('Assets/version.txt')) as fd:
+            v = fd.read().strip().removeprefix('v')
+    except Exception:
+        pass
+    return v
+
+
 # ---------------------------------------------------------------- 設定 (埋め込み)
-HOST = ""                # 既定は全インタフェース (WSL からそのまま叩ける)。このマシンだけに閉じるなら "127.0.0.1"
+HOST = ""                       # 既定は全インタフェース (WSL からそのまま叩ける)。このマシンだけに閉じるなら "127.0.0.1"
 PORT = 19876
-MAX_WIDTH = 480          # 帯の最大幅 px。これを超えた分は出さない
-FONT_SIZE = 22           # 大きく読めることが前提
-PAD_X = 10               # 帯の左右の余白
-GAP = 18                 # セグメント間の余白
-PART_GAP = 6             # セグメント内の画像と文字の間隔
+VERSION = getVersion()
+MAX_WIDTH = 480                 # 帯の最大幅 px。これを超えた分は出さない
+FONT_SIZE = 22                  # 大きく読めることが前提
+PAD_X = 10                      # 帯の左右の余白
+GAP = 18                        # セグメント間の余白
+PART_GAP = 6                    # セグメント内の画像と文字の間隔
 TEXT_COLOR = (255, 255, 255, 255)
-BG_COLOR = (0, 0, 0, 255)  # 当面は黒プレート (場所の切り分け用。透明に戻すなら (0,0,0,0))
-PLACEHOLDER_TEXT = "hekoo"        # 初期状態 (セグメント無し) の名乗り。本人と合意して正式採用
+BG_COLOR = (0, 0, 0, 255)       # 当面は黒プレート (場所の切り分け用。透明に戻すなら (0,0,0,0))
+PLACEHOLDER_TEXT = "hekoo"      # 初期状態 (セグメント無し) の名乗り。本人と合意して正式採用
 PLACEHOLDER_COLOR = (150, 150, 150, 255)
-SHOW_PLACEHOLDER = True           # 空のとき完全に引っ込みたい場合は False
-REPOSITION_MS = 1000     # 再配置と変化チェックの周期
-ANCHOR_DEADBAND = 8      # アンカーの右戻りで無視する幅 px (これ以下は停泊)
-ANCHOR_RESTORE_CYCLES = 60  # 右への大きな戻りを確定するまでの連続観測回数
-                         # (タイマ周期 1 秒なので約60秒。先住人の一時的な
-                         # 消失・再出現のバタつきを乗り切るための確認待ち)
-MAX_BODY = 4 * 1024 * 1024  # POST body の上限 (base64 の画像が入る大きさ)
-STRIP_HEIGHT = FONT_SIZE + 14  # 帯の厚み px。画像はこの厚みに合わせて縮小する (縦帯なら厚みは幅になる)
-MAX_IMAGE_W = 960        # 受け付ける画像の最大寸法 (超えたら 400)
+SHOW_PLACEHOLDER = True         # 空のとき完全に引っ込みたい場合は False
+REPOSITION_MS = 1000            # 再配置と変化チェックの周期
+ANCHOR_DEADBAND = 8             # アンカーの右戻りで無視する幅 px (これ以下は停泊)
+ANCHOR_RESTORE_CYCLES = 60      # 右への大きな戻りを確定するまでの連続観測回数
+                                # (タイマ周期 1 秒なので約60秒。先住人の一時的な
+                                # 消失・再出現のバタつきを乗り切るための確認待ち)
+MAX_BODY = 4 * 1024 * 1024      # POST body の上限 (base64 の画像が入る大きさ)
+STRIP_HEIGHT = FONT_SIZE + 14   # 帯の厚み px。画像はこの厚みに合わせて縮小する (縦帯なら厚みは幅になる)
+MAX_IMAGE_W = 960               # 受け付ける画像の最大寸法 (超えたら 400)
 MAX_IMAGE_H = 256
-DEFAULT_TTL = 900        # ttl 申告なしのときの既定値 (秒)。天気ポスターの周期5分の
-                         # 3周期分を目安に置いた初期値 (2026-11-22、実測から)
+DEFAULT_TTL = 900               # ttl 申告なしのときの既定値 (秒)。天気ポスターの周期5分の
+                                # 3周期分を目安に置いた初期値 (2026-11-22、実測から)
 
 NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 
@@ -615,6 +627,7 @@ class StripHost:
     """Shell_TrayWnd のレイヤード子窓として帯を出す。お手本の Create/Reposition 相当。"""
 
     ID_EXIT = 1001
+    ID_VERSION = 1002  # バージョン表記 (選んでも何もしない名乗り専用)
 
     def __init__(self, store):
         self.store = store
@@ -909,6 +922,8 @@ class StripHost:
 
     def _on_rbuttonup(self, hwnd, msg, wparam, lparam):
         menu = win32gui.CreatePopupMenu()
+        win32gui.AppendMenu(menu, win32con.MF_STRING, self.ID_VERSION, f"hekoo {VERSION}")
+        win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, None)
         win32gui.AppendMenu(menu, win32con.MF_STRING, self.ID_EXIT, "Exit")
         x, y = win32api.GetCursorPos()
         cmd = win32gui.TrackPopupMenu(
