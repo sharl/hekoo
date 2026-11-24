@@ -923,7 +923,7 @@ class StripHost:
     def _on_rbuttonup(self, hwnd, msg, wparam, lparam):
         menu = win32gui.CreatePopupMenu()
         win32gui.AppendMenu(menu, win32con.MF_STRING, self.ID_VERSION, f"hekoo {VERSION}")
-        win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, None)
+        win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
         win32gui.AppendMenu(menu, win32con.MF_STRING, self.ID_EXIT, "Exit")
         x, y = win32api.GetCursorPos()
         cmd = win32gui.TrackPopupMenu(
