@@ -2,6 +2,8 @@
 
 bring your messages/images on the taskbar
 
+![hekoo](Assets/icon.png)
+
 ### What does 'hekoo' mean?
 
 'hekoo' is a coined term inspired by the 'heko-obi' (兵児帯), a soft sash.  
@@ -67,3 +69,10 @@ Examples use [jo](https://github.com/jpmens/jo) to build JSON from shell argumen
 Plain JSON works too: curl --json '{"text": "hello, hekoo"}' ...
 
 https://github.com/jpmens/jo
+
+## Build
+
+```powershell
+pip install pyinstaller
+pyinstaller "hekoo.py" "--onefile" "--noconsole" "--icon=Assets/sample.ico" "--exclude-module=PIL._imagingcms" "--exclude-module=PIL._imagingtk"
+```
