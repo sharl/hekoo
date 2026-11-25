@@ -82,7 +82,9 @@ PART_GAP = 6                    # セグメント内の画像と文字の間隔
 TEXT_COLOR = (255, 255, 255, 255)
 TEXT_STROKE = 1                 # 文字の縁取りの太さ px。プレートが透明でも輪郭が立つように
 STROKE_COLOR = (0, 0, 0, 255)   # 縁取りの色。黒プレートの上では同化して見えない
-BG_COLOR = (0, 0, 0, 255)       # 当面は黒プレート (場所の切り分け用。透明に戻すなら (0,0,0,0))
+BG_COLOR = (0, 0, 0, 255)       # プレートの色 (render_strip の既定値。ホストは下の alpha で上書きする)
+PLATE_ALPHA_MIN = 1             # プレート alpha の下限。見た目は透明だが当たり判定は残る
+PLATE_ALPHA_MAX = 255           # プレート alpha の上限 (不透明)
 PLACEHOLDER_TEXT = "hekoo"      # 初期状態 (セグメント無し) の名乗り。本人と合意して正式採用
 PLACEHOLDER_COLOR = (150, 150, 150, 255)
 SHOW_PLACEHOLDER = True         # 空のとき完全に引っ込みたい場合は False
@@ -644,8 +646,8 @@ class StripHost:
         self._zstate = None
         self._tray_rect = None
         self._class_atom = None
-        self.plate_alpha = 255  # プレートの alpha。1 にすると見た目は透明だが
-                                # 当たり判定は残る (0 だとクリックが素通りする)
+        self.plate_alpha = PLATE_ALPHA_MIN  # プレートの alpha の既定値 (透明)。
+                                # 0 だとクリックが素通りするので下限は 1
         self._taskbar_created = win32gui.RegisterWindowMessage("TaskbarCreated")
 
     # --- 窓の生成と親子付け ---
@@ -930,7 +932,7 @@ class StripHost:
         win32gui.AppendMenu(menu, win32con.MF_STRING, self.ID_VERSION, f"hekoo {VERSION}")
         win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
         alpha_flags = win32con.MF_STRING
-        if self.plate_alpha == 1:
+        if self.plate_alpha == PLATE_ALPHA_MIN:
             alpha_flags |= win32con.MF_CHECKED
         win32gui.AppendMenu(menu, alpha_flags, self.ID_ALPHA, "Transparent plate")
         win32gui.AppendMenu(menu, win32con.MF_STRING, self.ID_EXIT, "Exit")
@@ -940,7 +942,7 @@ class StripHost:
         )
         win32gui.DestroyMenu(menu)
         if cmd == self.ID_ALPHA:
-            self.plate_alpha = 1 if self.plate_alpha == 255 else 255
+            self.plate_alpha = PLATE_ALPHA_MIN if self.plate_alpha == PLATE_ALPHA_MAX else PLATE_ALPHA_MAX
             self._version = -1  # 次のタイマで描き直させる
             _log(f"plate: alpha={self.plate_alpha}")
         elif cmd == self.ID_EXIT:
