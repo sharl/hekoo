@@ -25,7 +25,8 @@
 #   - 配置は右起点ゾーンと左起点ゾーンの2つ。セグメントは POST の
 #     zone で本籍を申告する (無申告は右起点)。タスクボタン群の端は
 #     UIA 観測スレッドが測り、帯はゾーンの最大幅に収めて被せない。
-#     右起点は先住人への回避 (avoid) つき
+#     右起点は先住人への回避 (avoid) つき。左起点の開始オフセットは
+#     POST /offset で申告する (右起点はトレイ端が観測できるので不要)
 #
 # お手本: krisgfx9/Wireless-Device-Battery-Monitor (Shell_TrayWnd の子窓方式)
 # テーマ追従の作法の出典: https://github.com/moses-palmer/pystray/issues/130
@@ -108,9 +109,9 @@ MAX_IMAGE_H = 256
 DEFAULT_TTL = 900               # ttl 申告なしのときの既定値 (秒)。天気ポスターの周期5分の
                                 # 3周期分を目安に置いた初期値 (2026-11-22、実測から)
 OBSERVE_SEC = 1.0               # ゾーン観測スレッドの周期 (秒)。本体タイマ (1秒) と揃える
-LEFT_OFFSET = 0                 # 左起点ゾーンの開始オフセット px。左隅の先住人は多様で
-                                # 観測できないものもいるので、本来は申告で受ける値。
-                                # 申告の受け口は後段に置く (今はこの定数で固定)
+LEFT_OFFSET = 0                 # 左起点ゾーンの開始オフセット px の既定値。左隅の先住人は
+                                # 多様で観測できないものもいるので、開始位置は POST /offset の
+                                # 申告で受ける (この定数は申告が来るまでの初期値)
 UIA_MAX_DEPTH = 12              # UIA ツリーを掘る深さの上限
 
 NAME_RE = re.compile(r"^[a-z0-9_-]+$")
@@ -284,6 +285,20 @@ def _normalize_zone(value):
     return False
 
 
+def _normalize_offset(value):
+    """offset フィールド (px) を正規化する。
+
+    0 以上の数なら int にして返す。それ以外 (負数、数でないもの、
+    フィールド自が無い None) は False。bool は int の顔をして
+    紛れ込むので明示的に弾く (ttl と同じ)。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if value < 0:
+        return False
+    return int(value)
+
+
 def _decode_image(b64):
     """base64 の画像を PIL Image (RGBA) にして返す。変なものは None。
 
@@ -302,7 +317,7 @@ def _decode_image(b64):
     return img
 
 
-def make_handler(store):
+def make_handler(store, offsets=None, territory=None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):  # 常駐物なので黙る
             pass
@@ -322,7 +337,32 @@ def make_handler(store):
                 return parts[1]
             return None
 
+        def _do_offset(self):
+            # POST /offset: 左起点オフセットの申告を受ける (セグメントとは別の宛先)
+            if offsets is None:
+                return self._send_json(404, {"ok": False, "error": "no such path"})
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if length <= 0 or length > MAX_BODY:
+                return self._send_json(400, {"ok": False, "error": "bad body size"})
+            try:
+                obj = json.loads(self.rfile.read(length).decode("utf-8"))
+                if not isinstance(obj, dict):
+                    raise ValueError
+            except Exception:
+                return self._send_json(400, {"ok": False, "error": "need JSON body"})
+            value = _normalize_offset(obj.get("offset"))
+            if value is False:
+                return self._send_json(400, {"ok": False, "error": "bad offset"})
+            offsets.set(value)
+            _log(f"post: offset={value}")
+            return self._send_json(200, {"ok": True, "offset": value})
+
         def do_POST(self):
+            if self.path == "/offset":
+                return self._do_offset()
             name = self._name()
             if name is None:
                 return self._send_json(404, {"ok": False, "error": "no such path"})
@@ -376,6 +416,10 @@ def make_handler(store):
         def do_GET(self):
             if self.path == "/health":
                 return self._send_json(200, {"ok": True})
+            if self.path == "/offset" and offsets is not None:
+                return self._send_json(200, {"ok": True, "offset": offsets.get()})
+            if self.path == "/territory" and territory is not None:
+                return self._send_json(200, {"ok": True, **territory.snapshot()})
             if self.path == "/segments":
                 return self._send_json(200, {"ok": True, "segments": store.public_dict()})
             return self._send_json(404, {"ok": False, "error": "no such path"})
@@ -383,9 +427,9 @@ def make_handler(store):
     return Handler
 
 
-def start_api(store, port=PORT):
+def start_api(store, port=PORT, offsets=None, territory=None):
     """API スレッドを立てる。戻り値はサーバ (テスト用に触れるように)。"""
-    server = ThreadingHTTPServer((HOST, port), make_handler(store))
+    server = ThreadingHTTPServer((HOST, port), make_handler(store, offsets, territory))
     t = threading.Thread(target=server.serve_forever, name="hekoo-api", daemon=True)
     t.start()
     return server
@@ -486,7 +530,12 @@ def _images_width(ims):
 
 
 def render_strip(items, color=TEXT_COLOR, bg=BG_COLOR, max_width=MAX_WIDTH):
-    """[(name, texts, images, zone), ...] から帯の画像 (RGBA) を作る。
+    """_render_strip の薄い包み: 画像だけを返す (テストと名札用)。"""
+    return _render_strip(items, color=color, bg=bg, max_width=max_width)[0]
+
+
+def _render_strip(items, color=TEXT_COLOR, bg=BG_COLOR, max_width=MAX_WIDTH):
+    """[(name, texts, images, zone), ...] から (帯の画像, 縮退したか) を作る。
 
     1セグメントは、画像列とテキストを同封した1ユニットとして描く
     (画像 (リスト順) → PART_GAP → テキストの順)。max_width (既定は
@@ -495,14 +544,17 @@ def render_strip(items, color=TEXT_COLOR, bg=BG_COLOR, max_width=MAX_WIDTH):
     「…」で切り詰める)、それも無理ならテキストを落として画像だけ残し
     (§6.1 の icon-only 縮退)、画像列だけでも入らなければ後ろの画像から
     落とし、それでも無理ならそのセグメントで打ち切る。
-    セグメントが無ければ None。
+    何か落としたり切り詰めたりしたら、2つ目の返り値が True になる
+    (「縮退した」のログ用)。
+    セグメントが無ければ (None, False)。
     画像は保持しているオリジナルから、描画のたびに厚みへ再計算して貼る。
     """
     if not items:
-        return None
+        return None, False
     meas = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
     kept = []  # (ims, fitted_text, text_w, text_bbox)
     width = PAD_X * 2
+    degraded = False
     for _name, texts, images, _zone in items:
         gap = GAP if kept else 0
         avail = max_width - width - gap
@@ -516,16 +568,21 @@ def render_strip(items, color=TEXT_COLOR, bg=BG_COLOR, max_width=MAX_WIDTH):
             if fitted is not None:
                 bbox = meas.textbbox((0, 0), fitted, font=_FONT, stroke_width=TEXT_STROKE)
                 tw = bbox[2] - bbox[0]
-            # fitted が None ならテキストは落とす (画像があれば icon-only 側へ)
+                if fitted != " ".join(texts):
+                    degraded = True  # 断片が落ちたか、切り詰められた
+            else:
+                degraded = True  # テキストは落とす (画像があれば icon-only 側へ)
         while ims and _images_width(ims) + (PART_GAP if fitted is not None else 0) + tw > avail:
             ims.pop()  # 画像列だけでも入らなければ、後ろの画像から落とす
+            degraded = True
         if not ims and fitted is None:
+            degraded = True
             break  # このセグメントは収まらないので打ち切る
         unit_w = _images_width(ims) + (PART_GAP if (ims and fitted is not None) else 0) + tw
         kept.append((ims, fitted, tw, bbox))
         width += gap + unit_w
     if not kept:
-        return None
+        return None, degraded
     height = STRIP_HEIGHT
     img = Image.new("RGBA", (width, height), bg)
     draw = ImageDraw.Draw(img)
@@ -544,7 +601,7 @@ def render_strip(items, color=TEXT_COLOR, bg=BG_COLOR, max_width=MAX_WIDTH):
             draw.text((x, y), fitted, font=_FONT, fill=color, stroke_width=TEXT_STROKE, stroke_fill=STROKE_COLOR)
             x += tw
         x += GAP
-    return img
+    return img, degraded
 
 
 def _describe(items):
@@ -632,6 +689,37 @@ def compute_zones(tray_left, rep_left, rep_right, notify_left):
             (notify_left, notify_left - rep_right))
 
 
+def _pick_left_wall(rects, start):
+    """左帯の通り道の壁を選ぶ (純粋関数)。
+
+    rects は (left, right) の列。start より手前で終わっているもの
+    (right <= start) は通り道にいないので除き、残りの左端の最小が
+    壁。帯の開始位置を覆っているもの (left < start < right) は
+    その左端が壁になり、予算は 0 に潰れて帯は引く。
+    """
+    walls = [l for (l, r) in rects if r > start]
+    return min(walls) if walls else None
+
+
+def _follow_start(rects, start):
+    """左帯の座り直し先を選ぶ (純粋関数)。
+
+    領土 (start から先) に先住人がいたら、一番近い先住人の
+    右端へ座り直す。座り直した先に重なる・連なる先住人が
+    いれば連鎖して越える。誰もいなければ start のまま。
+    申告した開始位置は「最も早い開始位置」であり、観測できる
+    先住人への譲り方はホストの作法 (右帯のアンカー回避と同じ)。
+    """
+    ahead = sorted((l, r) for (l, r) in rects if r > start)
+    if not ahead:
+        return start
+    seat = ahead[0][1]
+    for (l, r) in ahead[1:]:
+        if l <= seat:
+            seat = max(seat, r)
+    return seat
+
+
 class ZoneState:
     """観測スレッドからメインスレッドへのゾーン情報の受け渡し口。
 
@@ -644,6 +732,89 @@ class ZoneState:
     def __init__(self):
         self.q = queue.Queue()
         self.current = None   # ((左起点, 左最大幅), (右起点, 右最大幅)) or None
+
+
+class OffsetState:
+    """左起点オフセットの申告の置き場所 (POST /offset で書かれる)。
+
+    左隅の先住人は観測できないものがいるので、開始位置は申告で
+    受ける (TTL や zone と同じ申告制)。HTTP スレッドが書き、
+    左帯が読むので錠前つき。保存はメモリ上のみで、再起動したら
+    既定値 (LEFT_OFFSET) に戻る (永続化は PoC 越えなので後段)。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._value = LEFT_OFFSET
+
+    def get(self):
+        with self._lock:
+            return self._value
+
+    def set(self, value):
+        with self._lock:
+            self._value = value
+
+
+def _left_territory(zone, start, wall):
+    """左の領土 [from, to] を合成する (純粋関数)。
+
+    zone は観測値 (起点, 最大幅)。from は座り直し適用後の
+    開始位置 (申告 + follow の結果)、to はゾーン端と座席の
+    前方の壁の狭い方。空の領土は from > to のまま返す
+    (潰すと「なぜ空か」が消える)。ゾーンが観測できて
+    いなければ None (不明を 0 で誤魔化さない)。
+    """
+    if zone is None:
+        return None
+    origin, l_max = zone
+    end = origin + l_max
+    if wall is not None:
+        end = min(end, wall)
+    return [start, end]
+
+
+def _right_territory(zone, anchor):
+    """右の領土 [from, to] を合成する (純粋関数)。
+
+    zone は観測値 ((左...), (右起点, 右最大幅))、anchor は追随
+    ポリシー適用後の値 (生の測定値だと戻り待ちの間は嘘になる)。
+    from はボタン群の右端、to はアンカー。
+    """
+    if zone is None or anchor is None:
+        return None
+    (r_org, r_max) = zone[1]
+    return [r_org - r_max, anchor]
+
+
+class TerritoryState:
+    """GET /territory 用に、両帯が合成した領土と材料の置き場所。
+
+    測って合成するのは各帯のタイマ (メインスレッド) で、API
+    スレッドはここを読むだけ (窓を触るのはメインスレッド、
+    という紀律のまま)。ログに出すのは領土だけでシンプルに、
+    材料つきの詳細は GET /territory で返す (本人の決め)。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._left = {"zone": None, "offset": LEFT_OFFSET, "start": None,
+                      "wall": None, "territory": None}
+        self._right = {"zone": None, "anchor": None, "territory": None}
+
+    def put_left(self, zone, offset, start, wall, territory):
+        with self._lock:
+            self._left = {"zone": zone, "offset": offset, "start": start,
+                          "wall": wall, "territory": territory}
+
+    def put_right(self, zone, anchor, territory):
+        with self._lock:
+            self._right = {"zone": zone, "anchor": anchor,
+                           "territory": territory}
+
+    def snapshot(self):
+        with self._lock:
+            return {"left": dict(self._left), "right": dict(self._right)}
 
 
 def _find_tray_uia(root):
@@ -728,6 +899,51 @@ def start_zone_observer(state):
 
 
 # ---------------------------------------------------------------- Win32 ホスト
+class StartFollower:
+    """左帯の座り直しの非対称ポリシー (AnchorFollower の鏡像)。
+
+    右 (譲って座り直す) は即時、左 (申告位置へ戻る) は慎重に:
+    - 右への移動は領土の話 (被せない) なので即座に追う。
+    - 左への移動は見た目の話でしかないので、ANCHOR_DEADBAND
+      以下の戻りは無視して停泊し、それを超える戻りも
+      ANCHOR_RESTORE_CYCLES 回連続で同じ値を観測してから
+      確定する。先住人の幅がふらつくたびに帯が往復するのを
+      防ぐ (右帯のアンカーで実証済みの型の左右反転)。
+    """
+
+    def __init__(self):
+        self.applied = None      # 実際に使っている開始位置
+        self._candidate = None   # 左戻りの候補
+        self._count = 0          # 候補の連続観測回数
+
+    def update(self, measured):
+        """測定値を1回分食わせ、適用すべき開始位置を返す。"""
+        if self.applied is None:
+            self.applied = measured
+            return self.applied
+        if measured >= self.applied:
+            # 右 (譲る) か不変。即時に追い、左戻りの数え直しは捨てる
+            self.applied = measured
+            self._candidate = None
+            self._count = 0
+            return self.applied
+        # 左 (戻る)
+        if self.applied - measured <= ANCHOR_DEADBAND:
+            self._candidate = None
+            self._count = 0
+            return self.applied
+        if measured == self._candidate:
+            self._count += 1
+        else:
+            self._candidate = measured
+            self._count = 1
+        if self._count >= ANCHOR_RESTORE_CYCLES:
+            self.applied = measured
+            self._candidate = None
+            self._count = 0
+        return self.applied
+
+
 class AnchorFollower:
     """アンカー追随の非対称ポリシー (純粋な状態機械、窓には触らない)。
 
@@ -785,11 +1001,17 @@ class StripHost:
     WINDOW_CLASS = "HekooStripWindow"
     WINDOW_TITLE = "hekoo"
 
-    def __init__(self, store, zone_state=None):
+    def __init__(self, store, zone_state=None, offset_state=None, territory_state=None):
         self.store = store
         self.zone_state = zone_state
+        self.offset_state = offset_state
+        self.territory_state = territory_state
         self._budget = None      # 現在の描画幅予算 (変わったら描き直す)
         self._zones_seen = None  # 最後にログへ出したゾーン
+        self._wall_seen = None   # 左帯用: 最後にログへ出した先住人の壁
+        self._noplace_seen = False  # 「居場所なかった」を出したか
+        self._degraded_seen = False  # 「縮退した」を出したか
+        self._territory_seen = None  # 最後にログへ出した自分の領土
         self.hwnd = None
         self.tray = None
         self.notify = None
@@ -944,6 +1166,31 @@ class StripHost:
         (_l_org, _l_max), (r_org, r_max) = self.zone_state.current
         rep_right = r_org - r_max   # ボタン群の右端 (右ゾーンの左の壁)
         return max(0, min(MAX_WIDTH, anchor - rep_right))
+
+    def _watch_state(self, prefix, has_items, budget, degraded, noplace_detail):
+        """「居場所なかった」と「縮退した」を、状態が変わったときだけ出す。
+
+        どちらも「見た目が黙って変わる」隅の可視化 (本人の指示で
+        左右対称に有効)。セグメントが無いときは黙って初期状態に
+        戻す (失効で消えたのを「居場所ができた」「縮退が解消した」
+        とは言わない)。
+        """
+        if not has_items:
+            self._noplace_seen = False
+            self._degraded_seen = False
+            return
+        if budget == 0:
+            if not self._noplace_seen:
+                _log(f"{prefix}: 居場所なかった ({noplace_detail})")
+                self._noplace_seen = True
+            self._degraded_seen = False
+            return
+        if self._noplace_seen:
+            _log(f"{prefix}: 居場所ができた")
+            self._noplace_seen = False
+        if degraded != self._degraded_seen:
+            _log(f"{prefix}: 縮退した" if degraded else f"{prefix}: 縮退が解消した")
+            self._degraded_seen = degraded
 
     def _reposition(self, width, height, anchor):
         """右起点: アンカー (通常は TrayNotifyWnd の左端、先住人が居ればその左) に
@@ -1100,6 +1347,14 @@ class StripHost:
         self._drain_zones()
         anchor = self._measure_anchor()
         budget = self._right_budget(anchor)
+        snap = self.zone_state.current if self.zone_state is not None else None
+        terr = _right_territory(snap, anchor)
+        if terr != self._territory_seen:
+            _log(f"territory: right {terr[0]}..{terr[1]}" if terr else "territory: right -")
+            self._territory_seen = terr
+        if self.territory_state is not None:
+            zone_pair = [snap[1][0] - snap[1][1], snap[1][0]] if snap is not None else None
+            self.territory_state.put_right(zone_pair, anchor, terr)
         version, items = self.store.snapshot()
         right_items = [it for it in items if it[3] == "right"]
         if version != self._version or budget != self._budget:
@@ -1107,8 +1362,13 @@ class StripHost:
             self._budget = budget
             _log(f"timer: version={version} items={_describe(right_items)}")
             img = None
+            degraded = False
             if budget > 0:
-                img = render_strip(right_items, bg=(0, 0, 0, self.plate_alpha), max_width=budget)
+                img, degraded = _render_strip(right_items, bg=(0, 0, 0, self.plate_alpha), max_width=budget)
+                if img is None and right_items:
+                    degraded = True  # 入りきって消えたのも縮退の極限
+            self._watch_state("right", bool(right_items), budget, degraded,
+                              f"anchor={anchor}")
             if img is None and SHOW_PLACEHOLDER and budget > 0:
                 # 空でも名札だけは出す: 「常駐したよ、ここに出るよ」が見える方が
                 # 確認が楽 (本人の指摘)。本物のセグメントが来たらそちらに譲る
@@ -1161,7 +1421,10 @@ class StripHost:
 
 class LeftStripHost(StripHost):
     """左起点ゾーンの帯。観測と受け渡しは右帯と共有し、こちらは
-    左ゾーンのセグメントを起点 + オフセットから右へ描くだけ。
+    左ゾーンのセグメントを申告した開始位置から右へ描く。
+    領土内に HWND の先住人がいたら、その後ろに座り直す (follow、
+    既定の作法)。先住人の後ろに次の先住人がいれば、その手前で
+    止まる (被せない)。
 
     右クリックメニューは今のところ右帯の担当 (こちらは表示専用)。
     プレート alpha も当面は既定 (透明) のまま。
@@ -1171,24 +1434,90 @@ class LeftStripHost(StripHost):
     WINDOW_CLASS = "HekooStripWindowLeft"
     WINDOW_TITLE = "hekoo-left"
 
+    def __init__(self, store, zone_state=None, offset_state=None, territory_state=None):
+        super().__init__(store, zone_state, offset_state, territory_state)
+        self._start_follower = StartFollower()
+        self._eff_start = None     # 座り直し適用後の開始位置
+        self._follow_seen = None   # 最後にログへ出した開始位置
+
     def _on_rbuttonup(self, hwnd, msg, wparam, lparam):
         return 0
 
-    def _left_budget(self):
-        """左帯の描画幅予算。ゾーンが分かれば最大幅からオフセットを引いて絞る。"""
-        if self.zone_state is None or self.zone_state.current is None:
-            return MAX_WIDTH
-        (l_org, l_max), _r = self.zone_state.current
-        return max(0, min(MAX_WIDTH, l_max - LEFT_OFFSET))
+    def _left_offset(self):
+        """現在の左起点オフセット (申告があればそれ、無ければ既定値)。"""
+        if self.offset_state is not None:
+            return self.offset_state.get()
+        return LEFT_OFFSET
+
+    def _left_origin(self):
+        """左ゾーンの起点 (スクリーン x)。観測できていればそれ、無ければトレイ左端。"""
+        if self.zone_state is not None and self.zone_state.current is not None:
+            return self.zone_state.current[0][0]
+        try:
+            return win32gui.GetWindowRect(self.tray)[0]
+        except Exception:
+            return 0
+
+    def _left_rects(self):
+        """左帯の通り道にいる先住人の (left, right) の列を返す。
+
+        右側の _anchor_left と同じ流儀で、トレイの子窓を列挙して
+        「帯の通り道に立っている可視の子窓」を集める。XAML の土台
+        (全幅に広がる) と自分たちの帯は数えない。ReBarWindow32 は
+        タスクボタン群を内包する Explorer 自身の道具立てで、ボタン群の
+        領土はゾーン観測の方が正しく測っているので、先住人には数えない。
+        時計のようなオーバーレイはトレイの子窓ではないので、ここには
+        映らない (そちらはオフセット申告の担当)。
+        """
+        if not self.tray:
+            return []
+        try:
+            children = []
+
+            def _cb(hwnd, acc):
+                if win32gui.GetParent(hwnd) == self.tray:
+                    acc.append(hwnd)
+                return True
+
+            win32gui.EnumChildWindows(self.tray, _cb, children)
+            _tx, tray_top, _tx2, tray_bottom = win32gui.GetWindowRect(self.tray)
+        except Exception:
+            return []
+        rects = []
+        for h in children:
+            if h == self.hwnd or not win32gui.IsWindowVisible(h):
+                continue
+            try:
+                cls = win32gui.GetClassName(h)
+                l, t, r, b = win32gui.GetWindowRect(h)
+            except Exception:
+                continue
+            if cls.startswith("HekooStripWindow"):
+                continue
+            if cls in ("TrayNotifyWnd", "ReBarWindow32",
+                       "Windows.UI.Composition.DesktopWindowContentBridge",
+                       "Windows.UI.Input.InputSite.WindowClass"):
+                continue
+            if l < r and t < tray_bottom and b > tray_top:
+                rects.append((l, r))
+        return rects
+
+    def _left_budget(self, start, wall):
+        """左帯の描画幅予算。座席から見て、ゾーン端と前方の壁の狭い方で絞る。"""
+        if self.zone_state is not None and self.zone_state.current is not None:
+            (l_org, l_max), _r = self.zone_state.current
+            budget = min(MAX_WIDTH, l_org + l_max - start)
+        else:
+            budget = MAX_WIDTH
+        if wall is not None:
+            budget = min(budget, wall - start)
+        return max(0, budget)
 
     def _place_left(self, width, height):
-        """左起点: ゾーンの起点 + オフセットに帯の左端を合わせる。"""
-        tx, ty, _tx2, ty2 = win32gui.GetWindowRect(self.tray)
-        if self.zone_state is not None and self.zone_state.current is not None:
-            origin = self.zone_state.current[0][0]
-        else:
-            origin = tx
-        sx = origin + LEFT_OFFSET
+        """左起点: 座り直し適用後の開始位置に帯の左端を合わせる。"""
+        _tx, ty, _tx2, ty2 = win32gui.GetWindowRect(self.tray)
+        sx = self._eff_start if self._eff_start is not None \
+            else self._left_origin() + self._left_offset()
         sy = ty + ((ty2 - ty) - height) // 2
         cx, cy = win32gui.ScreenToClient(self.tray, (sx, sy))
         win32gui.SetWindowPos(
@@ -1216,14 +1545,49 @@ class LeftStripHost(StripHost):
             self._tray_rect = rect
         version, items = self.store.snapshot()
         left_items = [it for it in items if it[3] == "left"]
-        budget = self._left_budget()
+        rects = self._left_rects()
+        declared = self._left_origin() + self._left_offset()
+        start = self._start_follower.update(_follow_start(rects, declared))
+        self._eff_start = start
+        if start != self._follow_seen:
+            if self._follow_seen is not None:
+                if start > self._follow_seen:
+                    _log(f"left-follow: 先住人の後ろに座り直す (start={start})")
+                elif start == declared:
+                    _log(f"left-follow: 先住人が退いたので申告位置へ戻る (start={start})")
+                else:
+                    _log(f"left-follow: 先住人に追随して戻る (start={start})")
+            self._follow_seen = start
+        wall = _pick_left_wall(rects, start)
+        if wall != self._wall_seen:
+            if wall is None:
+                if start == declared:
+                    _log("left-anchor: 先住人がいなくなった")
+            else:
+                _log(f"left-anchor: 先住人がいるので手前で止める (wall={wall})")
+            self._wall_seen = wall
+        budget = self._left_budget(start, wall)
+        snap = self.zone_state.current if self.zone_state is not None else None
+        terr = _left_territory(snap[0] if snap is not None else None,
+                               start, wall)
+        if terr != self._territory_seen:
+            _log(f"territory: left {terr[0]}..{terr[1]}" if terr else "territory: left -")
+            self._territory_seen = terr
+        if self.territory_state is not None:
+            zone_pair = [snap[0][0], snap[0][0] + snap[0][1]] if snap is not None else None
+            self.territory_state.put_left(zone_pair, self._left_offset(), start, wall, terr)
         if version != self._version or budget != self._budget:
             self._version = version
             self._budget = budget
             _log(f"timer-left: version={version} items={_describe(left_items)}")
             img = None
+            degraded = False
             if budget > 0:
-                img = render_strip(left_items, bg=(0, 0, 0, self.plate_alpha), max_width=budget)
+                img, degraded = _render_strip(left_items, bg=(0, 0, 0, self.plate_alpha), max_width=budget)
+                if img is None and left_items:
+                    degraded = True  # 入りきって消えたのも縮退の極限
+            self._watch_state("left", bool(left_items), budget, degraded,
+                              f"start={start} wall={wall} offset={self._left_offset()}")
             if img is None:
                 win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
                 self._size = (0, 0)
@@ -1242,12 +1606,14 @@ def main():
     apply_theme_ritual()
     _log(f"font: {_FONT_NAME}")
     store = SegmentStore()
-    start_api(store)
+    offsets = OffsetState()
+    territory = TerritoryState()
+    start_api(store, offsets=offsets, territory=territory)
     zones = ZoneState()
     start_zone_observer(zones)
-    host = StripHost(store, zones)
+    host = StripHost(store, zones, territory_state=territory)
     host.attach()
-    left = LeftStripHost(store, zones)
+    left = LeftStripHost(store, zones, offsets, territory)
     left.attach()
 
     # Ctrl+C の既定動作 (KeyboardInterrupt) は WNDPROC の中で受けると
