@@ -22,8 +22,10 @@
 #   - 起動したら API スレッドが立ち、curl で流し込める
 #   - オプションなし。設定は全部このファイル冒頭に埋め込み
 #   - 描画は Pillow、窓は pywin32 のレイヤード子窓 (Tk レス)
-#   - 配置は右起点 + 最大幅キャップ + 先住人への回避 (avoid) まで。
-#     本格的な領土交渉は Stage 1 以降
+#   - 配置は右起点ゾーンと左起点ゾーンの2つ。セグメントは POST の
+#     zone で本籍を申告する (無申告は右起点)。タスクボタン群の端は
+#     UIA 観測スレッドが測り、帯はゾーンの最大幅に収めて被せない。
+#     右起点は先住人への回避 (avoid) つき
 #
 # お手本: krisgfx9/Wireless-Device-Battery-Monitor (Shell_TrayWnd の子窓方式)
 # テーマ追従の作法の出典: https://github.com/moses-palmer/pystray/issues/130
@@ -41,6 +43,7 @@ import ctypes
 import io
 import json
 import logging
+import queue
 import re
 import signal
 import sys
@@ -48,6 +51,11 @@ import threading
 import time
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
+
+try:
+    import uiautomation as uia
+except ImportError:     # 無い環境ではゾーン観測だけ止める (帯は従来動作で続く)
+    uia = None
 
 from getLog import getLog
 from utils import resource_path
@@ -99,6 +107,11 @@ MAX_IMAGE_W = 960               # 受け付ける画像の最大寸法 (超え�
 MAX_IMAGE_H = 256
 DEFAULT_TTL = 900               # ttl 申告なしのときの既定値 (秒)。天気ポスターの周期5分の
                                 # 3周期分を目安に置いた初期値 (2026-11-22、実測から)
+OBSERVE_SEC = 1.0               # ゾーン観測スレッドの周期 (秒)。本体タイマ (1秒) と揃える
+LEFT_OFFSET = 0                 # 左起点ゾーンの開始オフセット px。左隅の先住人は多様で
+                                # 観測できないものもいるので、本来は申告で受ける値。
+                                # 申告の受け口は後段に置く (今はこの定数で固定)
+UIA_MAX_DEPTH = 12              # UIA ツリーを掘る深さの上限
 
 NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 
@@ -121,24 +134,26 @@ class SegmentStore:
     TTL: 各セグメントは失効時刻 (time.monotonic の期限) を持ち、期限を
     過ぎたら purge_expired() が落とす。再 POST のたびに期限は張り直
     される (定期投げが生存確認を兼ねる、という設計原則)。
+    ゾーン: 各セグメントは本籍 (zone: "left"/"right") を持ち、帯は
+    ゾーンごとに分かれて描かれる。無申告の既定は "right"。
     """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._items = {}   # name -> (texts, images, expires_at) (挿入順)
+        self._items = {}   # name -> (texts, images, expires_at, zone) (挿入順)
         self._version = 0
 
-    def upsert(self, name, texts=None, images=None, ttl=DEFAULT_TTL):
+    def upsert(self, name, texts=None, images=None, ttl=DEFAULT_TTL, zone="right"):
         expires = time.monotonic() + ttl
         with self._lock:
-            self._items[name] = (texts, images, expires)
+            self._items[name] = (texts, images, expires, zone)
             self._version += 1
 
     def purge_expired(self):
         """期限切れのセグメントを落とし、落とした名前のリストを返す。"""
         now = time.monotonic()
         with self._lock:
-            expired = [n for n, (_t, _i, exp) in self._items.items()
+            expired = [n for n, (_t, _i, exp, _z) in self._items.items()
                        if exp <= now]
             for n in expired:
                 del self._items[n]
@@ -155,19 +170,20 @@ class SegmentStore:
             return False
 
     def snapshot(self):
-        """(version, [(name, texts, images), ...]) を返す。窓側はこれだけ読む。"""
+        """(version, [(name, texts, images, zone), ...]) を返す。窓側はこれだけ読む。"""
         with self._lock:
-            return self._version, [(n, ts, im) for n, (ts, im, _e) in self._items.items()]
+            return self._version, [(n, ts, im, z) for n, (ts, im, _e, z) in self._items.items()]
 
     def public_dict(self):
         """GET /segments 用。画像は base64 で返さず寸法だけ出す。
 
         テキストも画像も、要素が1つなら単体、複数ならリストで返す
         (受け口の正規化と対称な形)。
+        zone は既定 (right) でないときだけ付ける。
         """
         with self._lock:
             out = {}
-            for name, (texts, images, _exp) in self._items.items():
+            for name, (texts, images, _exp, zone) in self._items.items():
                 t = None
                 if texts is not None:
                     t = texts[0] if len(texts) == 1 else list(texts)
@@ -179,6 +195,12 @@ class SegmentStore:
                     out[name] = {"text": t, "image": dims} if t is not None else {"image": dims}
                 else:
                     out[name] = t
+                if zone != "right":
+                    # 既定でないゾーンだけ形に出す (右起点は従来の形のまま)
+                    if isinstance(out[name], dict):
+                        out[name]["zone"] = zone
+                    else:
+                        out[name] = {"text": out[name], "zone": zone}
             return out
 
 
@@ -248,6 +270,20 @@ def _normalize_ttl(value):
     return value
 
 
+def _normalize_zone(value):
+    """zone フィールド (本籍) を正規化する。
+
+    フィールド自が無ければ (null も同じ) None = 申告なし (既定の
+    "right" が効く)。"left"/"right" 以外は False。再 POST で省略
+    したら既定に戻る (丸ごと差し替えの一部、という作法は ttl と同じ)。
+    """
+    if value is None:
+        return None
+    if value in ("left", "right"):
+        return value
+    return False
+
+
 def _decode_image(b64):
     """base64 の画像を PIL Image (RGBA) にして返す。変なものは None。
 
@@ -314,6 +350,9 @@ def make_handler(store):
             ttl = _normalize_ttl(fields.get("ttl"))
             if ttl is False:
                 return self._send_json(400, {"ok": False, "error": "bad ttl"})
+            zone = _normalize_zone(fields.get("zone"))
+            if zone is False:
+                return self._send_json(400, {"ok": False, "error": "bad zone"})
             if texts is None and images is None:
                 return self._send_json(
                     400, {"ok": False, "error": "need \"text\" and/or \"image\""})
@@ -321,8 +360,9 @@ def make_handler(store):
                 effective, source = DEFAULT_TTL, "default"
             else:
                 effective, source = ttl, "declared"
-            store.upsert(name, texts, images, ttl=effective)
-            _log(f"post: {name} ttl={effective:g}s ({source})")
+            store.upsert(name, texts, images, ttl=effective, zone=zone or "right")
+            _log(f"post: {name} ttl={effective:g}s ({source})"
+                 + (f" zone={zone}" if zone else ""))
             return self._send_json(200, {"ok": True, "name": name})
 
         def do_DELETE(self):
@@ -445,11 +485,12 @@ def _images_width(ims):
     return sum(im.size[0] for im in ims) + PART_GAP * (len(ims) - 1)
 
 
-def render_strip(items, color=TEXT_COLOR, bg=BG_COLOR):
-    """[(name, texts, images), ...] から帯の画像 (RGBA) を作る。
+def render_strip(items, color=TEXT_COLOR, bg=BG_COLOR, max_width=MAX_WIDTH):
+    """[(name, texts, images, zone), ...] から帯の画像 (RGBA) を作る。
 
     1セグメントは、画像列とテキストを同封した1ユニットとして描く
-    (画像 (リスト順) → PART_GAP → テキストの順)。MAX_WIDTH に入らない
+    (画像 (リスト順) → PART_GAP → テキストの順)。max_width (既定は
+    MAX_WIDTH、ゾーンの最大幅でさらに絞れる) に入らない
     ときの縮退は、まずテキスト (断片の後ろから落とし、最後の1断片は
     「…」で切り詰める)、それも無理ならテキストを落として画像だけ残し
     (§6.1 の icon-only 縮退)、画像列だけでも入らなければ後ろの画像から
@@ -462,9 +503,9 @@ def render_strip(items, color=TEXT_COLOR, bg=BG_COLOR):
     meas = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
     kept = []  # (ims, fitted_text, text_w, text_bbox)
     width = PAD_X * 2
-    for _name, texts, images in items:
+    for _name, texts, images, _zone in items:
         gap = GAP if kept else 0
-        avail = MAX_WIDTH - width - gap
+        avail = max_width - width - gap
         ims = [_fit_image(im, STRIP_HEIGHT) for im in images] if images else []
         fitted = None
         bbox = None
@@ -509,7 +550,7 @@ def render_strip(items, color=TEXT_COLOR, bg=BG_COLOR):
 def _describe(items):
     """ログ用にセグメントを短く表す。画像の実物は repr せず寸法だけ出す。"""
     out = []
-    for name, texts, images in items:
+    for name, texts, images, _zone in items:
         parts = []
         if texts is not None:
             parts.append(" ".join(texts))
@@ -579,6 +620,113 @@ def apply_theme_ritual():
         pass  # 作法が効かなくても本体は止めない
 
 
+# ---------------------------------------------------------------- ゾーン観測
+def compute_zones(tray_left, rep_left, rep_right, notify_left):
+    """ゾーン計算 (純粋関数)。((左起点, 左最大幅), (右起点, 右最大幅)) を返す。
+
+    左起点ゾーンはトレイ左端からタスクボタン群 (TaskbarFrameRepeater)
+    の左端まで、右起点ゾーンはボタン群の右端から TrayNotifyWnd の
+    左端まで。帯はこの最大幅に収めることで、ボタンに被せない。
+    """
+    return ((tray_left, rep_left - tray_left),
+            (notify_left, notify_left - rep_right))
+
+
+class ZoneState:
+    """観測スレッドからメインスレッドへのゾーン情報の受け渡し口。
+
+    観測スレッドは変化があったときだけ Queue にスナップショットを
+    入れ、メインスレッド (右帯のタイマ) が取り出して current に
+    反映する。左帯は current を読むだけ (取り出すのは1人だけ、
+    という担当分け)。
+    """
+
+    def __init__(self):
+        self.q = queue.Queue()
+        self.current = None   # ((左起点, 左最大幅), (右起点, 右最大幅)) or None
+
+
+def _find_tray_uia(root):
+    """UIA ルート直下から Shell_TrayWnd (主タスクバー) を探す。"""
+    for child in root.GetChildren():
+        if child.ClassName == 'Shell_TrayWnd':
+            return child
+    return None
+
+
+def _find_child_uia(elem, pred, depth=0):
+    """UIA 部分木から pred に合う要素を最初に見つける。なければ None。"""
+    if depth > UIA_MAX_DEPTH:
+        return None
+    if pred(elem):
+        return elem
+    for child in elem.GetChildren():
+        found = _find_child_uia(child, pred, depth + 1)
+        if found is not None:
+            return found
+    return None
+
+
+def zone_observer(stop, state):
+    """UIA 専用スレッド。ゾーンを観測して Queue に流すだけ。窓には触らない。
+
+    UIA を UI スレッドから叩くと Explorer が固まることがあるので、
+    観測は必ずこのスレッドの中でやる (BatteryHub の widget.cpp と
+    同じ作法)。要素はキャッシュし、読みに失敗したら探し直す。
+    実証は probe.py で済み (2026-11-26、probe ブランチ)。
+    """
+    with uia.UIAutomationInitializerInThread():
+        root = uia.GetRootControl()
+        tray = None
+        repeater = None
+        notify = None
+        last = None           # 最後に Queue へ入れたスナップショット
+        while not stop.is_set():
+            try:
+                if tray is None:
+                    tray = _find_tray_uia(root)
+                    repeater = None
+                    notify = None
+                if tray is not None and repeater is None:
+                    repeater = _find_child_uia(
+                        tray, lambda e: (e.AutomationId or '') == 'TaskbarFrameRepeater')
+                if tray is not None and notify is None:
+                    notify = _find_child_uia(
+                        tray, lambda e: (e.ClassName or '') == 'TrayNotifyWnd')
+                if repeater is None or notify is None:
+                    snap = None
+                else:
+                    trect = tray.BoundingRectangle
+                    rep = repeater.BoundingRectangle
+                    ntf = notify.BoundingRectangle
+                    snap = compute_zones(trect.left, rep.left, rep.right, ntf.left)
+                if snap != last:
+                    state.q.put(snap)
+                    last = snap
+                    if snap is None:
+                        tray = None   # 次の周期で探し直す
+            except Exception:
+                if last is not None:
+                    state.q.put(None)
+                tray = None
+                repeater = None
+                notify = None
+                last = None
+            stop.wait(OBSERVE_SEC)
+
+
+def start_zone_observer(state):
+    """ゾーン観測スレッドを立てる。uiautomation が無ければ観測なし。"""
+    if uia is None:
+        _log("zone: uiautomation が無いので観測しない (帯は従来動作)")
+        return None
+    stop = threading.Event()
+    t = threading.Thread(target=zone_observer, args=(stop, state),
+                         name="hekoo-zone", daemon=True)
+    t.start()
+    return stop
+
+
 # ---------------------------------------------------------------- Win32 ホスト
 class AnchorFollower:
     """アンカー追随の非対称ポリシー (純粋な状態機械、窓には触らない)。
@@ -634,8 +782,14 @@ class StripHost:
     ID_VERSION = 1002  # バージョン表記 (選んでも何もしない名乗り専用)
     ID_ALPHA = 1003    # プレートの alpha 切り替え (255 ⇄ 1)
 
-    def __init__(self, store):
+    WINDOW_CLASS = "HekooStripWindow"
+    WINDOW_TITLE = "hekoo"
+
+    def __init__(self, store, zone_state=None):
         self.store = store
+        self.zone_state = zone_state
+        self._budget = None      # 現在の描画幅予算 (変わったら描き直す)
+        self._zones_seen = None  # 最後にログへ出したゾーン
         self.hwnd = None
         self.tray = None
         self.notify = None
@@ -667,7 +821,7 @@ class StripHost:
     def _create_window(self):
         wc = win32gui.WNDCLASS()
         wc.hInstance = win32api.GetModuleHandle(None)
-        wc.lpszClassName = "HekooStripWindow"
+        wc.lpszClassName = self.WINDOW_CLASS
         wc.lpfnWndProc = {
             win32con.WM_TIMER: self._on_timer,
             win32con.WM_RBUTTONUP: self._on_rbuttonup,
@@ -679,7 +833,7 @@ class StripHost:
         self.hwnd = win32gui.CreateWindowEx(
             win32con.WS_EX_LAYERED | win32con.WS_EX_NOACTIVATE,
             wc.lpszClassName,
-            "hekoo",
+            self.WINDOW_TITLE,
             win32con.WS_CHILD | win32con.WS_CLIPSIBLINGS,
             0, 0, 1, 1,
             self.tray, 0, wc.hInstance, None,
@@ -735,12 +889,15 @@ class StripHost:
             anchor = found
         return anchor
 
-    def _reposition(self, width, height):
-        """右起点: アンカー (通常は TrayNotifyWnd の左端、先住人が居ればその左) に
-        帯の右端を合わせる。"""
+    def _measure_anchor(self):
+        """アンカーを測定し、追随ポリシーを適用した適用値を返す。
+
+        描画幅の予算 (ゾーンの最大幅) を決めるのに適用値が要るので、
+        測定と追随は配置より前にタイマ側でやる。ログは従来通り、
+        適用値が変わったときだけ出す。
+        """
         if not self.notify:
-            return False
-        tx, ty, _tx2, ty2 = win32gui.GetWindowRect(self.tray)
+            return None
         nx, _ny, _nx2, _ny2 = win32gui.GetWindowRect(self.notify)
         measured = self._anchor_left(nx)
         prev = self._follower.applied
@@ -753,6 +910,47 @@ class StripHost:
                 _log(f"anchor: 先住人がいなくなったので定位置へ (notify left={nx})")
             else:
                 _log(f"anchor: 先住人が縮んだので右へ戻る (notify left={nx} -> {anchor})")
+        return anchor
+
+    def _drain_zones(self):
+        """観測スレッドからのスナップショットを取り出し、current に反映する。
+
+        取り出すのはこのタイマだけ (左帯は current を読むだけ)。
+        ログはスナップショットが変わったときだけ出す。
+        """
+        if self.zone_state is None:
+            return
+        changed = False
+        while True:
+            try:
+                snap = self.zone_state.q.get_nowait()
+            except queue.Empty:
+                break
+            self.zone_state.current = snap
+            changed = True
+        if changed and self.zone_state.current != self._zones_seen:
+            snap = self.zone_state.current
+            self._zones_seen = snap
+            if snap is None:
+                _log("zone: 観測できない")
+            else:
+                (l_org, l_max), (r_org, r_max) = snap
+                _log(f"zone: left origin={l_org} max={l_max} / right origin={r_org} max={r_max}")
+
+    def _right_budget(self, anchor):
+        """右帯の描画幅予算。ゾーンが分かれば最大幅で絞り、分からなければ MAX_WIDTH。"""
+        if anchor is None or self.zone_state is None or self.zone_state.current is None:
+            return MAX_WIDTH
+        (_l_org, _l_max), (r_org, r_max) = self.zone_state.current
+        rep_right = r_org - r_max   # ボタン群の右端 (右ゾーンの左の壁)
+        return max(0, min(MAX_WIDTH, anchor - rep_right))
+
+    def _reposition(self, width, height, anchor):
+        """右起点: アンカー (通常は TrayNotifyWnd の左端、先住人が居ればその左) に
+        帯の右端を合わせる。"""
+        if anchor is None:
+            return False
+        tx, ty, _tx2, ty2 = win32gui.GetWindowRect(self.tray)
         sx = anchor - width
         sy = ty + ((ty2 - ty) - height) // 2
         cx, cy = win32gui.ScreenToClient(self.tray, (sx, sy))
@@ -899,25 +1097,32 @@ class StripHost:
             self._tray_rect = rect
         for n in self.store.purge_expired():
             _log(f"expire: {n} (ttl)")
+        self._drain_zones()
+        anchor = self._measure_anchor()
+        budget = self._right_budget(anchor)
         version, items = self.store.snapshot()
-        if version != self._version:
+        right_items = [it for it in items if it[3] == "right"]
+        if version != self._version or budget != self._budget:
             self._version = version
-            _log(f"timer: version={version} items={_describe(items)}")
-            img = render_strip(items, bg=(0, 0, 0, self.plate_alpha))
-            if img is None and SHOW_PLACEHOLDER:
+            self._budget = budget
+            _log(f"timer: version={version} items={_describe(right_items)}")
+            img = None
+            if budget > 0:
+                img = render_strip(right_items, bg=(0, 0, 0, self.plate_alpha), max_width=budget)
+            if img is None and SHOW_PLACEHOLDER and budget > 0:
                 # 空でも名札だけは出す: 「常駐したよ、ここに出るよ」が見える方が
                 # 確認が楽 (本人の指摘)。本物のセグメントが来たらそちらに譲る
-                img = render_strip([("hekoo", [PLACEHOLDER_TEXT], None)], color=PLACEHOLDER_COLOR, bg=(0, 0, 0, self.plate_alpha))
+                img = render_strip([("hekoo", [PLACEHOLDER_TEXT], None, "right")], color=PLACEHOLDER_COLOR, bg=(0, 0, 0, self.plate_alpha), max_width=budget)
             if img is None:
                 win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
                 self._size = (0, 0)
             else:
                 # 先に表面を更新してから配置して見せる (お手本の Paint → Reposition の順)
                 self._blit(img)
-                if not self._reposition(img.size[0], img.size[1]):
+                if not self._reposition(img.size[0], img.size[1], anchor):
                     win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
         elif self._size != (0, 0):
-            self._reposition(*self._size)  # トレイ幅の変化に追随
+            self._reposition(*self._size, anchor)  # トレイ幅の変化に追随
         return 0
 
     def _on_taskbar_created(self, hwnd, msg, wparam, lparam):
@@ -954,6 +1159,82 @@ class StripHost:
         return 0
 
 
+class LeftStripHost(StripHost):
+    """左起点ゾーンの帯。観測と受け渡しは右帯と共有し、こちらは
+    左ゾーンのセグメントを起点 + オフセットから右へ描くだけ。
+
+    右クリックメニューは今のところ右帯の担当 (こちらは表示専用)。
+    プレート alpha も当面は既定 (透明) のまま。
+    セグメントの失効処理 (purge) は右帯のタイマが担当する。
+    """
+
+    WINDOW_CLASS = "HekooStripWindowLeft"
+    WINDOW_TITLE = "hekoo-left"
+
+    def _on_rbuttonup(self, hwnd, msg, wparam, lparam):
+        return 0
+
+    def _left_budget(self):
+        """左帯の描画幅予算。ゾーンが分かれば最大幅からオフセットを引いて絞る。"""
+        if self.zone_state is None or self.zone_state.current is None:
+            return MAX_WIDTH
+        (l_org, l_max), _r = self.zone_state.current
+        return max(0, min(MAX_WIDTH, l_max - LEFT_OFFSET))
+
+    def _place_left(self, width, height):
+        """左起点: ゾーンの起点 + オフセットに帯の左端を合わせる。"""
+        tx, ty, _tx2, ty2 = win32gui.GetWindowRect(self.tray)
+        if self.zone_state is not None and self.zone_state.current is not None:
+            origin = self.zone_state.current[0][0]
+        else:
+            origin = tx
+        sx = origin + LEFT_OFFSET
+        sy = ty + ((ty2 - ty) - height) // 2
+        cx, cy = win32gui.ScreenToClient(self.tray, (sx, sy))
+        win32gui.SetWindowPos(
+            self.hwnd, win32con.HWND_TOP, cx, cy, width, height,
+            win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW,
+        )
+        if (cx, cy) != self._client_xy or (width, height) != self._size:
+            _log(f"place-left: {width}x{height} at client=({cx}, {cy})")
+        self._client_xy = (cx, cy)
+        self._size = (width, height)
+        return True
+
+    def _on_timer(self, hwnd, msg, wparam, lparam):
+        if self.tray is None or not win32gui.IsWindow(self.tray):
+            self.attach()
+            if self.tray is None:
+                return 0
+        try:
+            rect = win32gui.GetWindowRect(self.tray)
+        except Exception:
+            rect = None
+        if rect is not None:
+            if self._tray_rect is not None and rect != self._tray_rect:
+                self._version = -1  # トレイの形が変わったら描き直す
+            self._tray_rect = rect
+        version, items = self.store.snapshot()
+        left_items = [it for it in items if it[3] == "left"]
+        budget = self._left_budget()
+        if version != self._version or budget != self._budget:
+            self._version = version
+            self._budget = budget
+            _log(f"timer-left: version={version} items={_describe(left_items)}")
+            img = None
+            if budget > 0:
+                img = render_strip(left_items, bg=(0, 0, 0, self.plate_alpha), max_width=budget)
+            if img is None:
+                win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
+                self._size = (0, 0)
+            else:
+                self._blit(img)
+                self._place_left(img.size[0], img.size[1])
+        elif self._size != (0, 0):
+            self._place_left(*self._size)
+        return 0
+
+
 # ---------------------------------------------------------------- 入口
 def main():
     if win32gui is None:
@@ -962,8 +1243,12 @@ def main():
     _log(f"font: {_FONT_NAME}")
     store = SegmentStore()
     start_api(store)
-    host = StripHost(store)
+    zones = ZoneState()
+    start_zone_observer(zones)
+    host = StripHost(store, zones)
     host.attach()
+    left = LeftStripHost(store, zones)
+    left.attach()
 
     # Ctrl+C の既定動作 (KeyboardInterrupt) は WNDPROC の中で受けると
     # pywin32 が "Python WNDPROC handler failed" と騒いで飲み込んでしまい、
