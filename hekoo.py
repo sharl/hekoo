@@ -80,6 +80,8 @@ PAD_X = 10                      # 帯の左右の余白
 GAP = 18                        # セグメント間の余白
 PART_GAP = 6                    # セグメント内の画像と文字の間隔
 TEXT_COLOR = (255, 255, 255, 255)
+TEXT_STROKE = 1                 # 文字の縁取りの太さ px。プレートが透明でも輪郭が立つように
+STROKE_COLOR = (0, 0, 0, 255)   # 縁取りの色。黒プレートの上では同化して見えない
 BG_COLOR = (0, 0, 0, 255)       # 当面は黒プレート (場所の切り分け用。透明に戻すなら (0,0,0,0))
 PLACEHOLDER_TEXT = "hekoo"      # 初期状態 (セグメント無し) の名乗り。本人と合意して正式採用
 PLACEHOLDER_COLOR = (150, 150, 150, 255)
@@ -384,7 +386,7 @@ def _fit_text(meas, text, limit):
     手紙を読まずに食べないための最小の縮退: 落とす前に、まず縮める。
     """
     def w(s):
-        b = meas.textbbox((0, 0), s, font=_FONT)
+        b = meas.textbbox((0, 0), s, font=_FONT, stroke_width=TEXT_STROKE)
         return b[2] - b[0]
 
     if w(text) <= limit:
@@ -406,7 +408,7 @@ def _fit_fragments(meas, fragments, limit):
     だけ「…」で切り詰める (単一 str の従来動作)。何も入らなければ None。
     """
     def w(s):
-        b = meas.textbbox((0, 0), s, font=_FONT)
+        b = meas.textbbox((0, 0), s, font=_FONT, stroke_width=TEXT_STROKE)
         return b[2] - b[0]
 
     kept = []
@@ -441,7 +443,7 @@ def _images_width(ims):
     return sum(im.size[0] for im in ims) + PART_GAP * (len(ims) - 1)
 
 
-def render_strip(items, color=TEXT_COLOR):
+def render_strip(items, color=TEXT_COLOR, bg=BG_COLOR):
     """[(name, texts, images), ...] から帯の画像 (RGBA) を作る。
 
     1セグメントは、画像列とテキストを同封した1ユニットとして描く
@@ -469,7 +471,7 @@ def render_strip(items, color=TEXT_COLOR):
             t_avail = avail - _images_width(ims) - (PART_GAP if ims else 0)
             fitted = _fit_fragments(meas, texts, t_avail) if t_avail > 0 else None
             if fitted is not None:
-                bbox = meas.textbbox((0, 0), fitted, font=_FONT)
+                bbox = meas.textbbox((0, 0), fitted, font=_FONT, stroke_width=TEXT_STROKE)
                 tw = bbox[2] - bbox[0]
             # fitted が None ならテキストは落とす (画像があれば icon-only 側へ)
         while ims and _images_width(ims) + (PART_GAP if fitted is not None else 0) + tw > avail:
@@ -482,7 +484,7 @@ def render_strip(items, color=TEXT_COLOR):
     if not kept:
         return None
     height = STRIP_HEIGHT
-    img = Image.new("RGBA", (width, height), BG_COLOR)
+    img = Image.new("RGBA", (width, height), bg)
     draw = ImageDraw.Draw(img)
     x = PAD_X
     for ims, fitted, tw, bbox in kept:
@@ -496,7 +498,7 @@ def render_strip(items, color=TEXT_COLOR):
                 x += PART_GAP
             # textbbox の上端オフセットを引いて、見た目で縦中央に寄せる
             y = (height - (bbox[3] - bbox[1])) // 2 - bbox[1]
-            draw.text((x, y), fitted, font=_FONT, fill=color)
+            draw.text((x, y), fitted, font=_FONT, fill=color, stroke_width=TEXT_STROKE, stroke_fill=STROKE_COLOR)
             x += tw
         x += GAP
     return img
@@ -628,6 +630,7 @@ class StripHost:
 
     ID_EXIT = 1001
     ID_VERSION = 1002  # バージョン表記 (選んでも何もしない名乗り専用)
+    ID_ALPHA = 1003    # プレートの alpha 切り替え (255 ⇄ 1)
 
     def __init__(self, store):
         self.store = store
@@ -641,6 +644,8 @@ class StripHost:
         self._zstate = None
         self._tray_rect = None
         self._class_atom = None
+        self.plate_alpha = 255  # プレートの alpha。1 にすると見た目は透明だが
+                                # 当たり判定は残る (0 だとクリックが素通りする)
         self._taskbar_created = win32gui.RegisterWindowMessage("TaskbarCreated")
 
     # --- 窓の生成と親子付け ---
@@ -896,11 +901,11 @@ class StripHost:
         if version != self._version:
             self._version = version
             _log(f"timer: version={version} items={_describe(items)}")
-            img = render_strip(items)
+            img = render_strip(items, bg=(0, 0, 0, self.plate_alpha))
             if img is None and SHOW_PLACEHOLDER:
                 # 空でも名札だけは出す: 「常駐したよ、ここに出るよ」が見える方が
                 # 確認が楽 (本人の指摘)。本物のセグメントが来たらそちらに譲る
-                img = render_strip([("hekoo", [PLACEHOLDER_TEXT], None)], color=PLACEHOLDER_COLOR)
+                img = render_strip([("hekoo", [PLACEHOLDER_TEXT], None)], color=PLACEHOLDER_COLOR, bg=(0, 0, 0, self.plate_alpha))
             if img is None:
                 win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
                 self._size = (0, 0)
@@ -924,13 +929,21 @@ class StripHost:
         menu = win32gui.CreatePopupMenu()
         win32gui.AppendMenu(menu, win32con.MF_STRING, self.ID_VERSION, f"hekoo {VERSION}")
         win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
+        alpha_flags = win32con.MF_STRING
+        if self.plate_alpha == 1:
+            alpha_flags |= win32con.MF_CHECKED
+        win32gui.AppendMenu(menu, alpha_flags, self.ID_ALPHA, "Transparent plate")
         win32gui.AppendMenu(menu, win32con.MF_STRING, self.ID_EXIT, "Exit")
         x, y = win32api.GetCursorPos()
         cmd = win32gui.TrackPopupMenu(
             menu, win32con.TPM_LEFTALIGN | win32con.TPM_RETURNCMD, x, y, 0, self.hwnd, None
         )
         win32gui.DestroyMenu(menu)
-        if cmd == self.ID_EXIT:
+        if cmd == self.ID_ALPHA:
+            self.plate_alpha = 1 if self.plate_alpha == 255 else 255
+            self._version = -1  # 次のタイマで描き直させる
+            _log(f"plate: alpha={self.plate_alpha}")
+        elif cmd == self.ID_EXIT:
             win32gui.DestroyWindow(self.hwnd)
         return 0
 
