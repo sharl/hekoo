@@ -1,6 +1,5 @@
 comtypes
 darkdetect
 pillow
-pip
 pywin32
 uiautomation
