@@ -63,6 +63,87 @@ $ jo segment=$(jo image="$(base64 -w0 emoji_u2603.png)" text=$(jo -a "\-10度" 2
 
 ![hekoo weather](Assets/weather.png)
 
+### add text to the left zone
+
+Segments live in the right zone by default. `zone=left` grows a segment from the left edge of the taskbar instead.
+
+```bash
+$ jo text="158.0.8127.88/.89" zone=left | curl --json @- 192.168.0.1:19876/segments/chrome
+{"ok": true, "name": "chrome"}
+```
+
+### offset
+
+The strip seats itself behind existing residents and follows them as they grow and shrink. The
+start offset is a declaration, for residents the strip cannot observe (a pinned clock overlay, for
+example):
+
+```bash
+$ jo offset=152 | curl -s --json @- 192.168.0.1:19876/offset
+{"ok": true, "offset": 152}
+```
+
+### get segments
+
+```bash
+$ curl -s 192.168.0.1:19876/segments | jq .
+{
+  "ok": true,
+  "segments": {
+    "weather": {
+      "text": "6.7度 11/26 Thu",
+      "image": "72x72"
+    },
+    "ollama": {
+      "text": "v0.40.18",
+      "zone": "left"
+    }
+  }
+}
+```
+
+### remove segment
+
+```bash
+$ curl -s -X DELETE 192.168.0.1:19876/segments/weather
+{"ok": true, "name": "weather"}
+```
+
+### get territory
+
+GET /territory shows where each zone may grow:
+
+```bash
+$ curl -s 192.168.0.1:19876/territory | jq .
+{
+  "ok": true,
+  "left": {
+    "zone": [
+      0,
+      1016
+    ],
+    "offset": 0,
+    "start": 298,
+    "wall": null,
+    "territory": [
+      298,
+      1016
+    ]
+  },
+  "right": {
+    "zone": [
+      1545,
+      1856
+    ],
+    "anchor": 1856,
+    "territory": [
+      1545,
+      1856
+    ]
+  }
+}
+```
+
 ### SEE ALSO
 
 Examples use [jo](https://github.com/jpmens/jo) to build JSON from shell arguments.  
