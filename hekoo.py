@@ -1024,7 +1024,6 @@ class StripHost:
         self._class_atom = None
         self.plate_alpha = PLATE_ALPHA_MIN  # プレートの alpha の既定値 (透明)。
                                 # 0 だとクリックが素通りするので下限は 1
-        self._taskbar_created = win32gui.RegisterWindowMessage("TaskbarCreated")
 
     # --- 窓の生成と親子付け ---
     def attach(self):
@@ -1033,6 +1032,12 @@ class StripHost:
             _log("attach: Shell_TrayWnd not found")
             return False
         self.notify = win32gui.FindWindowEx(self.tray, 0, "TrayNotifyWnd", None)
+        if self.hwnd is not None and not win32gui.IsWindow(self.hwnd):
+            # Explorer 再起動で親ごと壊れた窓。ハンドルだけ残って実体がない
+            _log("attach: strip window was destroyed, recreating")
+            self.hwnd = None
+            self._version = -1  # 作り直した窓には描き直させる
+            self._size = (0, 0)
         if self.hwnd is None:
             self._create_window()
         else:
@@ -1045,10 +1050,8 @@ class StripHost:
         wc.hInstance = win32api.GetModuleHandle(None)
         wc.lpszClassName = self.WINDOW_CLASS
         wc.lpfnWndProc = {
-            win32con.WM_TIMER: self._on_timer,
             win32con.WM_RBUTTONUP: self._on_rbuttonup,
             win32con.WM_DESTROY: self._on_destroy,
-            self._taskbar_created: self._on_taskbar_created,
         }
         if self._class_atom is None:
             self._class_atom = win32gui.RegisterClass(wc)
@@ -1060,14 +1063,10 @@ class StripHost:
             0, 0, 1, 1,
             self.tray, 0, wc.hInstance, None,
         )
-        # SetTimer は pywin32 の win32gui に露出していない (実機で確認)。
-        # 家の二段構え通り、pywin32 に無いものは ctypes で直接叩く。
-        # HWND はポインタ幅なので argtypes も付ける (blit 側と同じ理由)
-        user32 = ctypes.windll.user32
-        user32.SetTimer.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p,
-        ]
-        user32.SetTimer(self.hwnd, 1, REPOSITION_MS, None)
+        # タイマーはこの窓には付けない。帯の窓は Shell_TrayWnd の子で、
+        # Explorer 再起動のときに親ごと壊れてタイマーも道連れになる
+        # (2026-11-26／27 に実機で確認)。刻むのは番人 (Watchdog) の
+        # メッセージ専用窓の役目で、そちらから tick() が呼ばれる
 
     # --- 配置と転送 ---
     def _anchor_left(self, notify_left):
@@ -1120,7 +1119,12 @@ class StripHost:
         """
         if not self.notify:
             return None
-        nx, _ny, _nx2, _ny2 = win32gui.GetWindowRect(self.notify)
+        try:
+            nx, _ny, _nx2, _ny2 = win32gui.GetWindowRect(self.notify)
+        except Exception:
+            # Explorer の生まれ替わりの最中など、notify がまだ掴めない
+            # (2026-11-28 の復帰検証で移行の 1 秒間に 1400 を観測)
+            return None
         measured = self._anchor_left(nx)
         prev = self._follower.applied
         anchor = self._follower.update(measured)
@@ -1326,11 +1330,12 @@ class StripHost:
         user32.ReleaseDC(0, hdc_screen)
 
     # --- メッセージ処理 ---
-    def _on_timer(self, hwnd, msg, wparam, lparam):
+    def tick(self):
+        # 番人 (Watchdog) のタイマーから毎秒呼ばれる。再配置と再描画の本体
         if self.tray is None or not win32gui.IsWindow(self.tray):
             self.attach()
             if self.tray is None:
-                return 0
+                return
         # タスクバーの位置・大きさ・向きが変わったら描き直させる。
         # オリエンテーションの変更は再描画で吸収する (本人の見立て)
         try:
@@ -1383,14 +1388,13 @@ class StripHost:
                     win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
         elif self._size != (0, 0):
             self._reposition(*self._size, anchor)  # トレイ幅の変化に追随
-        return 0
 
-    def _on_taskbar_created(self, hwnd, msg, wparam, lparam):
-        # Explorer 再起動。親を探し直して付け直す。セグメントは保持したまま
+    def on_taskbar_created(self):
+        # Explorer 再起動 (番人経由で呼ばれる)。親を探し直して付け直す。
+        # セグメントは保持したまま
         self.tray = None
-        self._version = -1  # 次のタイマで描き直させる
+        self._version = -1  # 次の tick で描き直させる
         self.attach()
-        return 0
 
     def _on_rbuttonup(self, hwnd, msg, wparam, lparam):
         menu = win32gui.CreatePopupMenu()
@@ -1530,11 +1534,12 @@ class LeftStripHost(StripHost):
         self._size = (width, height)
         return True
 
-    def _on_timer(self, hwnd, msg, wparam, lparam):
+    def tick(self):
+        # 右帯と同じく、番人のタイマーから毎秒呼ばれる
         if self.tray is None or not win32gui.IsWindow(self.tray):
             self.attach()
             if self.tray is None:
-                return 0
+                return
         try:
             rect = win32gui.GetWindowRect(self.tray)
         except Exception:
@@ -1596,6 +1601,79 @@ class LeftStripHost(StripHost):
                 self._place_left(img.size[0], img.size[1])
         elif self._size != (0, 0):
             self._place_left(*self._size)
+
+
+class Watchdog:
+    """帯の窓の番人。メッセージ専用窓 (親 = HWND_MESSAGE) でタイマーと
+    TaskbarCreated を受ける。
+
+    帯の窓は Shell_TrayWnd の子なので、Explorer が再起動すると親ごと
+    壊れる。以前はタイマーも TaskbarCreated の受け先も帯の窓自身で、
+    壊れた瞬間に復帰の経路まで一緒に消えた (2026-11-26／27 に実機で
+    確認)。番人の窓はトレイの子ではないので殻の生死と無関係に残り、
+    毎秒の tick と再起動の通知を帯へ届け続ける。
+
+    HWND の操作はすべてメインスレッドのこの窓経由 (家の作法どおり)。
+    片方の帯の tick が例外を出しても、もう片方は止めない。
+    """
+
+    WINDOW_CLASS = "HekooWatchdogWindow"
+    WINDOW_TITLE = "hekoo-watchdog"
+
+    def __init__(self, hosts):
+        self.hosts = hosts
+        self.hwnd = None
+        self._class_atom = None
+        self._taskbar_created = win32gui.RegisterWindowMessage("TaskbarCreated")
+
+    def start(self):
+        wc = win32gui.WNDCLASS()
+        wc.hInstance = win32api.GetModuleHandle(None)
+        wc.lpszClassName = self.WINDOW_CLASS
+        wc.lpfnWndProc = {
+            win32con.WM_TIMER: self._on_timer,
+            win32con.WM_DESTROY: self._on_destroy,
+            self._taskbar_created: self._on_taskbar_created,
+        }
+        if self._class_atom is None:
+            self._class_atom = win32gui.RegisterClass(wc)
+        self.hwnd = win32gui.CreateWindowEx(
+            0,
+            wc.lpszClassName,
+            self.WINDOW_TITLE,
+            0,
+            0, 0, 0, 0,
+            win32con.HWND_MESSAGE, 0, wc.hInstance, None,
+        )
+        # SetTimer は pywin32 の win32gui に露出していない (実機で確認)。
+        # 家の二段構え通り、pywin32 に無いものは ctypes で直接叩く。
+        # HWND はポインタ幅なので argtypes も付ける (blit 側と同じ理由)
+        user32 = ctypes.windll.user32
+        user32.SetTimer.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p,
+        ]
+        user32.SetTimer(self.hwnd, 1, REPOSITION_MS, None)
+        _log(f"watchdog: hwnd={self.hwnd}")
+
+    def _on_timer(self, hwnd, msg, wparam, lparam):
+        for host in self.hosts:
+            try:
+                host.tick()
+            except Exception as e:
+                _log(f"watchdog: tick failed: {type(e).__name__}: {e}")
+        return 0
+
+    def _on_taskbar_created(self, hwnd, msg, wparam, lparam):
+        _log("watchdog: TaskbarCreated")
+        for host in self.hosts:
+            try:
+                host.on_taskbar_created()
+            except Exception as e:
+                _log(f"watchdog: reattach failed: {type(e).__name__}: {e}")
+        return 0
+
+    def _on_destroy(self, hwnd, msg, wparam, lparam):
+        win32gui.PostQuitMessage(0)
         return 0
 
 
@@ -1612,8 +1690,10 @@ def main():
     zones = ZoneState()
     start_zone_observer(zones)
     host = StripHost(store, zones, territory_state=territory)
-    host.attach()
     left = LeftStripHost(store, zones, offsets, territory)
+    watchdog = Watchdog([host, left])
+    watchdog.start()
+    host.attach()
     left.attach()
 
     # Ctrl+C の既定動作 (KeyboardInterrupt) は WNDPROC の中で受けると
