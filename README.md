@@ -11,7 +11,8 @@ Picture a band made of software - the image comes from an association
 with the lost 'deskband'.
 
 proof of concept with Muse inspired by the amazing invention by @KrisGfx
-https://github.com/krisgfx9/Wireless-Device-Battery-Monitor
+https://git.krisgfx.com/krisgfx/WirelessBatteryHub
+(formerly on GitHub: https://github.com/krisgfx9/Wireless-Device-Battery-Monitor)
 
 ## Run
 
