@@ -701,7 +701,7 @@ def _pick_left_wall(rects, start):
     return min(walls) if walls else None
 
 
-def _follow_start(rects, start):
+def _follow_start(rects, start, zone_end=None):
     """左帯の座り直し先を選ぶ (純粋関数)。
 
     領土 (start から先) に先住人がいたら、一番近い先住人の
@@ -709,8 +709,15 @@ def _follow_start(rects, start):
     いれば連鎖して越える。誰もいなければ start のまま。
     申告した開始位置は「最も早い開始位置」であり、観測できる
     先住人への譲り方はホストの作法 (右帯のアンカー回避と同じ)。
+
+    ゾーン端が分かっているときは、右端がゾーン端を越える
+    先住人は座り直しの相手にしない。領土の外の住人を追うと
+    帯まで領土の外へ出てしまう (2026-11-28、右ゾーンに
+    住み始めた BatteryHub を追って左帯が消えた件)。そういう
+    相手は壁 (_pick_left_wall) の担当で、帯は手前に残る。
     """
-    ahead = sorted((l, r) for (l, r) in rects if r > start)
+    ahead = sorted((l, r) for (l, r) in rects
+                   if r > start and (zone_end is None or r <= zone_end))
     if not ahead:
         return start
     seat = ahead[0][1]
@@ -718,6 +725,33 @@ def _follow_start(rects, start):
         if l <= seat:
             seat = max(seat, r)
     return seat
+
+
+def _choose_left_seat(rects, declared, zone_end=None):
+    """左帯の座席を選ぶ (純粋関数)。(座席, 追わなかったか) を返す。
+
+    座り直し (follow) した席と、申告位置に残る席 (先住人は壁に
+    なる) の両方について描画幅の予算を数え、広い方に座る。
+    遠くの先住人を追うと帯がゾーン端に潰れて縮退するので、
+    そういう相手は追わずに壁で受ける (2026-11-28、タスクバー
+    アプリの直前に移った BatteryHub を追って縮退した件)。
+    同点なら申告位置。予算の数え方は _left_budget と同じ。
+    """
+    def budget(start, wall):
+        b = MAX_WIDTH if zone_end is None \
+            else min(MAX_WIDTH, zone_end - start)
+        if wall is not None:
+            b = min(b, wall - start)
+        return max(0, b)
+
+    followed = _follow_start(rects, declared, zone_end)
+    if followed == declared:
+        return declared, False
+    b_follow = budget(followed, _pick_left_wall(rects, followed))
+    b_stay = budget(declared, _pick_left_wall(rects, declared))
+    if b_stay >= b_follow:
+        return declared, True
+    return followed, False
 
 
 class ZoneState:
@@ -1415,10 +1449,17 @@ class StripHost:
             self._version = -1  # 次のタイマで描き直させる
             _log(f"plate: alpha={self.plate_alpha}")
         elif cmd == self.ID_EXIT:
+            # 終了経路の可視化 (2026-11-28): メニュー Exit が空振りして
+            # プロンプトに戻らなかった件の切り分け用。destroy の前後と
+            # _on_destroy の quit 投稿にログを置き、どこまで進んで
+            # どこで止まったかをログだけで追えるようにする
+            _log(f"exit: destroy hwnd={self.hwnd}")
             win32gui.DestroyWindow(self.hwnd)
+            _log("exit: destroy から戻った")
         return 0
 
     def _on_destroy(self, hwnd, msg, wparam, lparam):
+        _log("destroy: quit を投げる")
         win32gui.PostQuitMessage(0)
         return 0
 
@@ -1552,12 +1593,20 @@ class LeftStripHost(StripHost):
         left_items = [it for it in items if it[3] == "left"]
         rects = self._left_rects()
         declared = self._left_origin() + self._left_offset()
-        start = self._start_follower.update(_follow_start(rects, declared))
+        snap = self.zone_state.current if self.zone_state is not None else None
+        zone_end = snap[0][0] + snap[0][1] if snap is not None else None
+        seat, declined = _choose_left_seat(rects, declared, zone_end)
+        start = self._start_follower.update(seat)
         self._eff_start = start
         if start != self._follow_seen:
+            # 座席が動いたら、そのとき見えていた先住人の rect を残す
+            # (2026-11-28: BatteryHub の窓の本当の形を確認するため)
+            _log(f"left-rects: {rects}")
             if self._follow_seen is not None:
                 if start > self._follow_seen:
                     _log(f"left-follow: 先住人の後ろに座り直す (start={start})")
+                elif start == declared and declined:
+                    _log(f"left-follow: 追うより広いので申告位置に座る (start={start})")
                 elif start == declared:
                     _log(f"left-follow: 先住人が退いたので申告位置へ戻る (start={start})")
                 else:
@@ -1572,7 +1621,6 @@ class LeftStripHost(StripHost):
                 _log(f"left-anchor: 先住人がいるので手前で止める (wall={wall})")
             self._wall_seen = wall
         budget = self._left_budget(start, wall)
-        snap = self.zone_state.current if self.zone_state is not None else None
         terr = _left_territory(snap[0] if snap is not None else None,
                                start, wall)
         if terr != self._territory_seen:
@@ -1700,6 +1748,7 @@ def main():
     # pywin32 が "Python WNDPROC handler failed" と騒いで飲み込んでしまい、
     # ループが終わらない。SIGINT で PostQuitMessage するのが静かな終わり方
     def _on_sigint(signum, frame):
+        _log("sigint: quit を投げる")
         win32gui.PostQuitMessage(0)
 
     signal.signal(signal.SIGINT, _on_sigint)
